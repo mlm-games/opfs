@@ -293,6 +293,7 @@ impl crate::FileHandle for FileHandle {
         Ok(self.data.read().unwrap().len() as u64)
     }
 
+    #[cfg(any(not(target_arch = "wasm32"), web_sys_unstable_apis))]
     async fn create_sync_access_handle(&self) -> Result<Self::SyncAccessHandleT, Self::Error> {
         Ok(SyncAccessHandle(self.data.clone()))
     }
