@@ -1,14 +1,15 @@
 use crate::persistent::Error;
 use futures::Stream;
 use futures::StreamExt;
-use js_sys::{ArrayBuffer, AsyncIterator, Uint8Array};
+use js_sys::{ArrayBuffer, Uint8Array};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::{JsFuture, stream::JsStream};
 use web_sys::{
     FileSystemCreateWritableOptions, FileSystemDirectoryHandle, FileSystemFileHandle,
-    FileSystemGetFileOptions, FileSystemRemoveOptions, FileSystemWritableFileStream,
+    FileSystemGetFileOptions, FileSystemReadWriteOptions, FileSystemRemoveOptions,
+    FileSystemWritableFileStream,
 };
 
 type DirectoryEntry = crate::DirectoryEntry<DirectoryHandle, FileHandle>;
@@ -29,7 +30,7 @@ pub struct WritableFileStream(FileSystemWritableFileStream);
 pub struct File(web_sys::File);
 
 #[derive(Debug)]
-pub struct SyncAccessHandle;
+pub struct SyncAccessHandle(web_sys::FileSystemSyncAccessHandle);
 
 impl From<FileSystemDirectoryHandle> for DirectoryHandle {
     fn from(handle: FileSystemDirectoryHandle) -> Self {
@@ -66,34 +67,33 @@ impl crate::private::Sealed for SyncAccessHandle {}
 impl crate::SyncAccessHandle for SyncAccessHandle {
     type Error = Error;
 
-    fn read(&self, _buffer: &mut [u8], _at: u64) -> Result<usize, Self::Error> {
-        Err(Error::Msg(
-            "SyncAccessHandle requires --cfg web_sys_unstable_apis".into(),
-        ))
+    fn read(&self, buffer: &mut [u8], at: u64) -> Result<usize, Self::Error> {
+        let options = FileSystemReadWriteOptions::new();
+        options.set_at(at);
+        let n = self.0.read_with_u8_array_and_options(buffer, &options)?;
+        Ok(n as usize)
     }
 
-    fn write(&self, _data: &[u8], _at: u64) -> Result<usize, Self::Error> {
-        Err(Error::Msg(
-            "SyncAccessHandle requires --cfg web_sys_unstable_apis".into(),
-        ))
+    fn write(&self, data: &[u8], at: u64) -> Result<usize, Self::Error> {
+        let options = FileSystemReadWriteOptions::new();
+        options.set_at(at);
+        let n = self.0.write_with_u8_array_and_options(data, &options)?;
+        Ok(n as usize)
     }
 
-    fn truncate(&self, _size: u64) -> Result<(), Self::Error> {
-        Err(Error::Msg(
-            "SyncAccessHandle requires --cfg web_sys_unstable_apis".into(),
-        ))
+    fn truncate(&self, size: u64) -> Result<(), Self::Error> {
+        self.0.truncate_with_f64(size as f64)?;
+        Ok(())
     }
 
     fn get_size(&self) -> Result<u64, Self::Error> {
-        Err(Error::Msg(
-            "SyncAccessHandle requires --cfg web_sys_unstable_apis".into(),
-        ))
+        let size = self.0.get_size()?;
+        Ok(size as u64)
     }
 
     fn flush(&self) -> Result<(), Self::Error> {
-        Err(Error::Msg(
-            "SyncAccessHandle requires --cfg web_sys_unstable_apis".into(),
-        ))
+        self.0.flush()?;
+        Ok(())
     }
 }
 
@@ -153,8 +153,7 @@ impl crate::DirectoryHandle for DirectoryHandle {
     ) -> Result<impl Stream<Item = Result<(String, DirectoryEntry), Self::Error>>, Self::Error>
     {
         let entries_iterator = self.0.entries();
-        let async_iterator = AsyncIterator::from(entries_iterator);
-        let js_stream: JsStream = JsStream::from(async_iterator);
+        let js_stream: JsStream = JsStream::from(entries_iterator);
 
         let stream = js_stream.map(|item| {
             match item {
@@ -198,10 +197,10 @@ impl crate::FileHandle for FileHandle {
         &mut self,
         options: &crate::CreateWritableOptions,
     ) -> Result<Self::WritableFileStreamT, Self::Error> {
-        if options.mode == crate::WritableMode::Exclusive {
-            if self.writer_active.swap(true, Ordering::SeqCst) {
-                return Err(Error::Msg("File is already open for writing".into()));
-            }
+        if options.mode == crate::WritableMode::Exclusive
+            && self.writer_active.swap(true, Ordering::SeqCst)
+        {
+            return Err(Error::Msg("File is already open for writing".into()));
         }
         let fs_options = FileSystemCreateWritableOptions::new();
         fs_options.set_keep_existing_data(options.keep_existing_data);
@@ -230,10 +229,9 @@ impl crate::FileHandle for FileHandle {
 
     #[cfg(web_sys_unstable_apis)]
     async fn create_sync_access_handle(&self) -> Result<Self::SyncAccessHandleT, Self::Error> {
-        let _ = JsFuture::from(self.inner.create_sync_access_handle()).await?;
-        Err(Error::Msg(
-            "SyncAccessHandle: real web implementation pending web-sys bindings".into(),
-        ))
+        let handle = JsFuture::from(self.inner.create_sync_access_handle()).await?;
+        let handle = wasm_bindgen::JsCast::unchecked_into::<web_sys::FileSystemSyncAccessHandle>(handle);
+        Ok(SyncAccessHandle(handle))
     }
 }
 
@@ -359,6 +357,7 @@ impl File {
         Ok(vec)
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn text(&self) -> Result<String, Error> {
         JsFuture::from(self.0.text())
             .await?
