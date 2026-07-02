@@ -33,8 +33,8 @@ impl std::fmt::Display for Error {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl std::error::Error for Error {
+    #[cfg(not(target_arch = "wasm32"))]
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Io(e) => Some(e),
