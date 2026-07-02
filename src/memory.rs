@@ -12,18 +12,28 @@ pub struct DirectoryHandle(Rc<RefCell<HashMap<String, DirectoryEntry>>>);
 
 /// A virtual file in the in-memory filesystem.
 #[derive(Debug, Clone)]
-pub struct FileHandle(WritableFileStream);
+pub struct FileHandle(Rc<RefCell<Vec<u8>>>);
 
 /// A writable file stream in the in-memory filesystem.
+///
+/// Writes go to a staging buffer. On [`close`](WritableFileStream::close),
+/// the staging buffer atomically replaces the target file's data.
 #[derive(Debug, Clone)]
 pub struct WritableFileStream {
-    cursor_pos: usize,
-    stream: Rc<RefCell<Vec<u8>>>,
+    cursor_pos: u64,
+    staging: Vec<u8>,
+    target: Rc<RefCell<Vec<u8>>>,
 }
 
 impl crate::private::Sealed for DirectoryHandle {}
 impl crate::private::Sealed for FileHandle {}
 impl crate::private::Sealed for WritableFileStream {}
+
+impl FileHandle {
+    fn new() -> Self {
+        Self(Rc::new(RefCell::new(Vec::new())))
+    }
+}
 
 impl crate::DirectoryHandle for DirectoryHandle {
     type Error = String;
@@ -111,11 +121,13 @@ impl crate::DirectoryHandle for DirectoryHandle {
         &self,
     ) -> Result<impl Stream<Item = Result<(String, DirectoryEntry), Self::Error>>, Self::Error>
     {
+        // Making this lazy would hold the Ref guard across await points, causing runtime panics.
         let directory = self.0.borrow();
         let entries: Vec<_> = directory
             .iter()
             .map(|(name, entry)| Ok((name.clone(), entry.clone())))
             .collect();
+        drop(directory);
         Ok(futures::stream::iter(entries))
     }
 }
@@ -133,29 +145,30 @@ impl crate::FileHandle for FileHandle {
         &mut self,
         options: &crate::CreateWritableOptions,
     ) -> Result<Self::WritableFileStreamT, Self::Error> {
-        if !options.keep_existing_data {
-            self.0.stream.borrow_mut().clear();
-        }
+        let staging = if options.keep_existing_data {
+            self.0.borrow().clone()
+        } else {
+            Vec::new()
+        };
         Ok(WritableFileStream {
             cursor_pos: 0,
-            ..self.0.clone()
+            staging,
+            target: self.0.clone(),
         })
     }
 
     async fn read(&self) -> Result<Vec<u8>, Self::Error> {
-        let stream = self.0.stream.clone();
-        let data = stream.borrow().clone();
-        Ok(data)
+        Ok(self.0.borrow().clone())
     }
 
-    async fn read_range<R: std::ops::RangeBounds<usize> + Send>(
+    async fn read_range<R: std::ops::RangeBounds<u64> + Send>(
         &self,
         range: R,
     ) -> Result<Vec<u8>, Self::Error> {
         use std::ops::Bound;
 
-        let stream = self.0.stream.borrow();
-        let len = stream.len();
+        let data = self.0.borrow();
+        let len = data.len() as u64;
 
         let start = match range.start_bound() {
             Bound::Included(&n) => n,
@@ -169,7 +182,6 @@ impl crate::FileHandle for FileHandle {
             Bound::Unbounded => len,
         };
 
-        // Handle the case where start is beyond file size by returning empty vec
         if start >= len {
             return Ok(Vec::new());
         }
@@ -179,11 +191,11 @@ impl crate::FileHandle for FileHandle {
             return Ok(Vec::new());
         }
 
-        Ok(stream[start..actual_end].to_vec())
+        Ok(data[start as usize..actual_end as usize].to_vec())
     }
 
-    async fn size(&self) -> Result<usize, Self::Error> {
-        Ok(self.0.len())
+    async fn size(&self) -> Result<u64, Self::Error> {
+        Ok(self.0.borrow().len() as u64)
     }
 }
 
@@ -191,15 +203,14 @@ impl crate::WritableFileStream for WritableFileStream {
     type Error = String;
 
     async fn write_at_cursor_pos(&mut self, data: &[u8]) -> Result<(), Self::Error> {
-        let data_len = data.len();
-
-        let mut stream = self.stream.borrow_mut();
-        let mut new_stream = stream[0..self.cursor_pos].to_vec();
-        new_stream.extend_from_slice(data);
-        *stream = new_stream;
-
+        let data_len = data.len() as u64;
+        let needed_len = self.cursor_pos + data_len;
+        if needed_len > self.staging.len() as u64 {
+            self.staging.resize(needed_len as usize, 0);
+        }
+        let start = self.cursor_pos as usize;
+        self.staging[start..start + data.len()].copy_from_slice(data);
         self.cursor_pos += data_len;
-
         Ok(())
     }
 
@@ -210,17 +221,13 @@ impl crate::WritableFileStream for WritableFileStream {
             WriteCommandType::Write => {
                 if let Some(data) = &params.data {
                     if let Some(position) = params.position {
-                        // Write at specific position without changing cursor
-                        let data_len = data.len();
-                        let mut stream = self.stream.borrow_mut();
-
-                        // Ensure the stream is large enough
-                        if position + data_len > stream.len() {
-                            stream.resize(position + data_len, 0);
+                        let data_len = data.len() as u64;
+                        let needed_len = position + data_len;
+                        if needed_len > self.staging.len() as u64 {
+                            self.staging.resize(needed_len as usize, 0);
                         }
-
-                        // Write data at position
-                        stream[position..position + data_len].copy_from_slice(data);
+                        let start = position as usize;
+                        self.staging[start..start + data.len()].copy_from_slice(data);
                     } else {
                         self.write_at_cursor_pos(data).await?;
                     }
@@ -246,9 +253,8 @@ impl crate::WritableFileStream for WritableFileStream {
         Ok(())
     }
 
-    async fn truncate(&mut self, size: usize) -> Result<(), Self::Error> {
-        let mut stream = self.stream.borrow_mut();
-        stream.resize(size, 0);
+    async fn truncate(&mut self, size: u64) -> Result<(), Self::Error> {
+        self.staging.resize(size as usize, 0);
         if self.cursor_pos > size {
             self.cursor_pos = size;
         }
@@ -256,38 +262,14 @@ impl crate::WritableFileStream for WritableFileStream {
     }
 
     async fn close(&mut self) -> Result<(), Self::Error> {
-        // no op
+        let staging = std::mem::take(&mut self.staging);
+        *self.target.borrow_mut() = staging;
         Ok(())
     }
 
-    async fn seek(&mut self, offset: usize) -> Result<(), Self::Error> {
-        if offset > self.len() {
-            return Err(format!(
-                "cannot seek to {offset} because the file is only {len} bytes long",
-                len = self.len()
-            ));
-        }
+    async fn seek(&mut self, offset: u64) -> Result<(), Self::Error> {
         self.cursor_pos = offset;
         Ok(())
-    }
-}
-
-impl FileHandle {
-    fn new() -> Self {
-        Self(WritableFileStream::new())
-    }
-}
-
-impl WritableFileStream {
-    fn new() -> Self {
-        Self {
-            cursor_pos: 0,
-            stream: Rc::new(RefCell::new(Vec::new())),
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.stream.borrow().len()
     }
 }
 
@@ -324,7 +306,7 @@ mod tests {
 
         let read_data = file.read().await.unwrap();
         assert_eq!(read_data, data);
-        assert_eq!(file.size().await.unwrap(), data.len());
+        assert_eq!(file.size().await.unwrap(), data.len() as u64);
     }
 
     #[tokio::test]
@@ -413,7 +395,7 @@ mod tests {
         writer.close().await.unwrap();
 
         let data = file.read().await.unwrap();
-        assert_eq!(data, b"Hi");
+        assert_eq!(data, b"Hillo");
     }
 
     #[tokio::test]
@@ -435,10 +417,13 @@ mod tests {
             .unwrap();
 
         writer.write_at_cursor_pos(b"Hello").await.unwrap();
+        writer.seek(10).await.unwrap();
+        writer.write_at_cursor_pos(b"!").await.unwrap();
+        writer.close().await.unwrap();
 
-        let result = writer.seek(10).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("cannot seek"));
+        let data = file.read().await.unwrap();
+        assert_eq!(data, b"Hello\0\0\0\0\0!");
+        assert_eq!(file.size().await.unwrap(), 11);
     }
 
     #[tokio::test]

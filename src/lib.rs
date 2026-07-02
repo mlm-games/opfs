@@ -91,8 +91,8 @@ pub enum WriteCommandType {
 pub struct WriteParams {
     pub command_type: WriteCommandType,
     pub data: Option<Vec<u8>>,
-    pub position: Option<usize>,
-    pub size: Option<usize>,
+    pub position: Option<u64>,
+    pub size: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -150,12 +150,12 @@ pub trait FileHandle: Debug + private::Sealed {
 
     fn read(&self) -> impl std::future::Future<Output = Result<Vec<u8>, Self::Error>>;
 
-    fn read_range<R: RangeBounds<usize> + Send>(
+    fn read_range<R: RangeBounds<u64> + Send>(
         &self,
         range: R,
     ) -> impl std::future::Future<Output = Result<Vec<u8>, Self::Error>>;
 
-    fn size(&self) -> impl std::future::Future<Output = Result<usize, Self::Error>>;
+    fn size(&self) -> impl std::future::Future<Output = Result<u64, Self::Error>>;
 }
 
 pub trait WritableFileStream: Debug + private::Sealed {
@@ -173,11 +173,11 @@ pub trait WritableFileStream: Debug + private::Sealed {
 
     fn truncate(
         &mut self,
-        size: usize,
+        size: u64,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>>;
 
     fn close(&mut self) -> impl std::future::Future<Output = Result<(), Self::Error>>;
 
-    fn seek(&mut self, offset: usize)
+    fn seek(&mut self, offset: u64)
     -> impl std::future::Future<Output = Result<(), Self::Error>>;
 }

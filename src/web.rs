@@ -158,7 +158,7 @@ impl crate::FileHandle for FileHandle {
         self.get_file().await?.read().await
     }
 
-    async fn read_range<R: std::ops::RangeBounds<usize> + Send>(
+    async fn read_range<R: std::ops::RangeBounds<u64> + Send>(
         &self,
         range: R,
     ) -> Result<Vec<u8>, Self::Error> {
@@ -166,7 +166,7 @@ impl crate::FileHandle for FileHandle {
         file.read_range(range).await
     }
 
-    async fn size(&self) -> Result<usize, Self::Error> {
+    async fn size(&self) -> Result<u64, Self::Error> {
         let size = self.get_file().await?.size();
         Ok(size)
     }
@@ -232,8 +232,8 @@ impl crate::WritableFileStream for WritableFileStream {
         Ok(())
     }
 
-    async fn truncate(&mut self, size: usize) -> Result<(), Self::Error> {
-        JsFuture::from(self.0.truncate_with_u32(size as u32)?).await?;
+    async fn truncate(&mut self, size: u64) -> Result<(), Self::Error> {
+        JsFuture::from(self.0.truncate_with_f64(size as f64)?).await?;
         Ok(())
     }
 
@@ -242,26 +242,26 @@ impl crate::WritableFileStream for WritableFileStream {
         Ok(())
     }
 
-    async fn seek(&mut self, offset: usize) -> Result<(), Self::Error> {
-        JsFuture::from(self.0.seek_with_u32(offset as u32)?).await?;
+    async fn seek(&mut self, offset: u64) -> Result<(), Self::Error> {
+        JsFuture::from(self.0.seek_with_f64(offset as f64)?).await?;
         Ok(())
     }
 }
 
 impl File {
-    fn size(&self) -> usize {
-        self.0.size() as usize
+    fn size(&self) -> u64 {
+        self.0.size() as u64
     }
 
     async fn read(&self) -> Result<Vec<u8>, JsValue> {
         let buffer = ArrayBuffer::unchecked_from_js(JsFuture::from(self.0.array_buffer()).await?);
         let uint8_array = Uint8Array::new(&buffer);
-        let mut vec = vec![0; self.size()];
+        let mut vec = vec![0; self.size() as usize];
         uint8_array.copy_to(&mut vec);
         Ok(vec)
     }
 
-    async fn read_range<R: std::ops::RangeBounds<usize>>(
+    async fn read_range<R: std::ops::RangeBounds<u64>>(
         &self,
         range: R,
     ) -> Result<Vec<u8>, JsValue> {
@@ -291,15 +291,13 @@ impl File {
             return Ok(Vec::new());
         }
 
-        // Use the slice method to get a portion of the file
         let blob: Blob = self
             .0
             .slice_with_f64_and_f64(start as f64, actual_end as f64)?;
 
-        // Read the blob
         let buffer = ArrayBuffer::unchecked_from_js(JsFuture::from(blob.array_buffer()).await?);
         let uint8_array = Uint8Array::new(&buffer);
-        let mut vec = vec![0; actual_end - start];
+        let mut vec = vec![0; (actual_end - start) as usize];
         uint8_array.copy_to(&mut vec);
         Ok(vec)
     }

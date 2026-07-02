@@ -1,8 +1,7 @@
 use futures::Stream;
-use std::sync::Arc;
+use std::path::Path;
 use std::{io::SeekFrom, path::PathBuf};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::RwLock;
 
 type DirectoryEntry = crate::DirectoryEntry<DirectoryHandle, FileHandle>;
 
@@ -12,8 +11,17 @@ pub struct DirectoryHandle(PathBuf);
 #[derive(Clone, Debug)]
 pub struct FileHandle(PathBuf);
 
-#[derive(Clone, Debug)]
-pub struct WritableFileStream(Arc<RwLock<tokio::fs::File>>);
+/// A writable file stream backed by a temporary file.
+///
+/// Writes go to a temp file in the same directory as the target.
+/// On [`close`](WritableFileStream::close), the temp file is atomically
+/// renamed over the target (matching OPFS commit-on-close semantics).
+#[derive(Debug)]
+pub struct WritableFileStream {
+    file: Option<tokio::fs::File>,
+    target_path: PathBuf,
+    temp: Option<tempfile::NamedTempFile>,
+}
 
 impl From<PathBuf> for DirectoryHandle {
     fn from(handle: PathBuf) -> Self {
@@ -24,12 +32,6 @@ impl From<PathBuf> for DirectoryHandle {
 impl From<PathBuf> for FileHandle {
     fn from(handle: PathBuf) -> Self {
         Self(handle)
-    }
-}
-
-impl From<tokio::fs::File> for WritableFileStream {
-    fn from(handle: tokio::fs::File) -> Self {
-        Self(Arc::new(RwLock::new(handle)))
     }
 }
 
@@ -150,14 +152,23 @@ impl crate::FileHandle for FileHandle {
         &mut self,
         options: &crate::CreateWritableOptions,
     ) -> Result<Self::WritableFileStreamT, Self::Error> {
-        let file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(!options.keep_existing_data)
-            .open(&self.0)
-            .await?;
+        let parent = self.0.parent().unwrap_or(Path::new("."));
+        let temp = tempfile::NamedTempFile::new_in(parent)?;
+        let mut file = tokio::fs::File::from_std(temp.as_file().try_clone()?);
 
-        Ok(WritableFileStream(Arc::new(RwLock::new(file))))
+        if options.keep_existing_data {
+            if let Ok(src) = tokio::fs::File::open(&self.0).await {
+                let mut src = src;
+                tokio::io::copy(&mut src, &mut file).await?;
+            }
+            file.seek(SeekFrom::Start(0)).await?;
+        }
+
+        Ok(WritableFileStream {
+            file: Some(file),
+            target_path: self.0.clone(),
+            temp: Some(temp),
+        })
     }
 
     async fn read(&self) -> Result<Vec<u8>, Self::Error> {
@@ -169,7 +180,7 @@ impl crate::FileHandle for FileHandle {
         Ok(buffer)
     }
 
-    async fn read_range<R: std::ops::RangeBounds<usize> + Send>(
+    async fn read_range<R: std::ops::RangeBounds<u64> + Send>(
         &self,
         range: R,
     ) -> Result<Vec<u8>, Self::Error> {
@@ -177,7 +188,7 @@ impl crate::FileHandle for FileHandle {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
         let mut file = tokio::fs::File::open(&self.0).await?;
-        let file_size = file.metadata().await?.len() as usize;
+        let file_size = file.metadata().await?.len();
 
         let start = match range.start_bound() {
             Bound::Included(&n) => n,
@@ -202,15 +213,15 @@ impl crate::FileHandle for FileHandle {
             return Ok(Vec::new());
         }
 
-        file.seek(SeekFrom::Start(start as u64)).await?;
-        let mut buffer = vec![0; bytes_to_read];
+        file.seek(SeekFrom::Start(start)).await?;
+        let mut buffer = vec![0; bytes_to_read as usize];
         file.read_exact(&mut buffer).await?;
         Ok(buffer)
     }
 
-    async fn size(&self) -> Result<usize, Self::Error> {
+    async fn size(&self) -> Result<u64, Self::Error> {
         let metadata = tokio::fs::metadata(&self.0).await?;
-        Ok(metadata.len() as usize)
+        Ok(metadata.len())
     }
 }
 
@@ -218,21 +229,30 @@ impl crate::WritableFileStream for WritableFileStream {
     type Error = std::io::Error;
 
     async fn write_at_cursor_pos(&mut self, data: &[u8]) -> Result<(), Self::Error> {
-        let mut file = self.0.write().await;
-        file.write_all(data).await?;
-        Ok(())
+        match self.file.as_mut() {
+            Some(file) => {
+                file.write_all(data).await?;
+                Ok(())
+            }
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "stream is closed",
+            )),
+        }
     }
 
     async fn write_with_params(&mut self, params: &crate::WriteParams) -> Result<(), Self::Error> {
         use crate::WriteCommandType;
 
-        let mut file = self.0.write().await;
+        let file = self.file.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "stream is closed")
+        })?;
 
         match params.command_type {
             WriteCommandType::Write => {
                 if let Some(data) = &params.data {
                     if let Some(position) = params.position {
-                        file.seek(SeekFrom::Start(position as u64)).await?;
+                        file.seek(SeekFrom::Start(position)).await?;
                     }
                     file.write_all(data).await?;
                 } else {
@@ -244,7 +264,7 @@ impl crate::WritableFileStream for WritableFileStream {
             }
             WriteCommandType::Seek => {
                 if let Some(position) = params.position {
-                    file.seek(SeekFrom::Start(position as u64)).await?;
+                    file.seek(SeekFrom::Start(position)).await?;
                 } else {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
@@ -254,7 +274,11 @@ impl crate::WritableFileStream for WritableFileStream {
             }
             WriteCommandType::Truncate => {
                 if let Some(size) = params.size {
-                    file.set_len(size as u64).await?;
+                    file.set_len(size).await?;
+                    let pos = file.seek(SeekFrom::Current(0)).await?;
+                    if pos > size {
+                        file.seek(SeekFrom::Start(size)).await?;
+                    }
                 } else {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
@@ -266,22 +290,45 @@ impl crate::WritableFileStream for WritableFileStream {
         Ok(())
     }
 
-    async fn truncate(&mut self, size: usize) -> Result<(), Self::Error> {
-        let file = self.0.write().await;
-        file.set_len(size as u64).await?;
-        Ok(())
+    async fn truncate(&mut self, size: u64) -> Result<(), Self::Error> {
+        match self.file.as_mut() {
+            Some(file) => {
+                file.set_len(size).await?;
+                let pos = file.seek(SeekFrom::Current(0)).await?;
+                if pos > size {
+                    file.seek(SeekFrom::Start(size)).await?;
+                }
+                Ok(())
+            }
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "stream is closed",
+            )),
+        }
     }
 
     async fn close(&mut self) -> Result<(), Self::Error> {
-        let mut file = self.0.write().await;
-        file.shutdown().await?;
+        if let Some(mut file) = self.file.take() {
+            file.shutdown().await?;
+            drop(file);
+        }
+        if let Some(temp) = self.temp.take() {
+            temp.persist(&self.target_path).map_err(|e| e.error)?;
+        }
         Ok(())
     }
 
-    async fn seek(&mut self, offset: usize) -> Result<(), Self::Error> {
-        let mut file = self.0.write().await;
-        file.seek(SeekFrom::Start(offset as u64)).await?;
-        Ok(())
+    async fn seek(&mut self, offset: u64) -> Result<(), Self::Error> {
+        match self.file.as_mut() {
+            Some(file) => {
+                file.seek(SeekFrom::Start(offset)).await?;
+                Ok(())
+            }
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "stream is closed",
+            )),
+        }
     }
 }
 
@@ -325,7 +372,7 @@ mod tests {
 
         let read_data = file.read().await.unwrap();
         assert_eq!(read_data, data);
-        assert_eq!(file.size().await.unwrap(), data.len());
+        assert_eq!(file.size().await.unwrap(), data.len() as u64);
     }
 
     #[tokio::test]

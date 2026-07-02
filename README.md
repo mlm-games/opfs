@@ -43,7 +43,7 @@ async fn example(dir: DirectoryHandle) -> persistent::Result<()> {
     let write_options = CreateWritableOptions { keep_existing_data: false };
     let mut writer = file.create_writable_with_options(&write_options).await?;
     
-    writer.write_at_cursor_pos(b"Hello, world!".to_vec()).await?;
+    writer.write_at_cursor_pos(b"Hello, world!").await?;
     writer.close().await?;
     
     let data = file.read().await?;
