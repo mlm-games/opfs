@@ -39,6 +39,28 @@ impl crate::private::Sealed for DirectoryHandle {}
 impl crate::private::Sealed for FileHandle {}
 impl crate::private::Sealed for WritableFileStream {}
 
+fn validate_name(name: &str) -> Result<(), std::io::Error> {
+    if name.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "name must not be empty",
+        ));
+    }
+    if name == "." || name == ".." {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("'{}' is not a valid name", name),
+        ));
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("'{}' contains path separators", name),
+        ));
+    }
+    Ok(())
+}
+
 impl crate::DirectoryHandle for DirectoryHandle {
     type Error = std::io::Error;
     type FileHandleT = FileHandle;
@@ -48,16 +70,20 @@ impl crate::DirectoryHandle for DirectoryHandle {
         name: &str,
         options: &crate::GetFileHandleOptions,
     ) -> Result<Self::FileHandleT, Self::Error> {
+        validate_name(name)?;
         let mut path = self.0.clone();
         path.push(name);
 
-        // Make sure the file exists
-        let _ = tokio::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(options.create)
-            .open(&path)
-            .await?;
+        if options.create {
+            tokio::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .await?;
+        } else {
+            tokio::fs::metadata(&path).await?;
+        }
 
         Ok(FileHandle(path))
     }
@@ -67,22 +93,27 @@ impl crate::DirectoryHandle for DirectoryHandle {
         name: &str,
         options: &crate::GetDirectoryHandleOptions,
     ) -> Result<Self, Self::Error> {
+        validate_name(name)?;
         let mut path = self.0.clone();
         path.push(name);
 
         if options.create {
             tokio::fs::create_dir_all(&path).await?;
-        } else if !path.exists() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("Directory '{}' not found", name),
-            ));
+        } else {
+            let metadata = tokio::fs::metadata(&path).await?;
+            if !metadata.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("'{}' is not a directory", name),
+                ));
+            }
         }
 
         Ok(DirectoryHandle(path))
     }
 
     async fn remove_entry(&mut self, name: &str) -> Result<(), Self::Error> {
+        validate_name(name)?;
         let mut path = self.0.clone();
         path.push(name);
 
@@ -101,6 +132,7 @@ impl crate::DirectoryHandle for DirectoryHandle {
         name: &str,
         options: &crate::FileSystemRemoveOptions,
     ) -> Result<(), Self::Error> {
+        validate_name(name)?;
         let mut path = self.0.clone();
         path.push(name);
 
@@ -308,9 +340,11 @@ impl crate::WritableFileStream for WritableFileStream {
     }
 
     async fn close(&mut self) -> Result<(), Self::Error> {
-        if let Some(mut file) = self.file.take() {
-            file.shutdown().await?;
+        if let Some(file) = self.file.take() {
+            file.sync_all().await?;
             drop(file);
+        } else {
+            return Ok(()); // already closed
         }
         if let Some(temp) = self.temp.take() {
             temp.persist(&self.target_path).map_err(|e| e.error)?;

@@ -1,28 +1,32 @@
 //! "in-memory" filesystem for use in tests or when persistence isn't necessary
 
 use futures::Stream;
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 
 /// An entry in a virtual directory in the in-memory filesystem.
 pub type DirectoryEntry = crate::DirectoryEntry<DirectoryHandle, FileHandle>;
 
 /// A virtual directory in the in-memory filesystem.
 #[derive(Debug, Clone)]
-pub struct DirectoryHandle(Rc<RefCell<HashMap<String, DirectoryEntry>>>);
+pub struct DirectoryHandle(Arc<RwLock<HashMap<String, DirectoryEntry>>>);
 
 /// A virtual file in the in-memory filesystem.
 #[derive(Debug, Clone)]
-pub struct FileHandle(Rc<RefCell<Vec<u8>>>);
+pub struct FileHandle(Arc<RwLock<Vec<u8>>>);
 
 /// A writable file stream in the in-memory filesystem.
 ///
 /// Writes go to a staging buffer. On [`close`](WritableFileStream::close),
 /// the staging buffer atomically replaces the target file's data.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct WritableFileStream {
     cursor_pos: u64,
     staging: Vec<u8>,
-    target: Rc<RefCell<Vec<u8>>>,
+    target: Arc<RwLock<Vec<u8>>>,
+    closed: bool,
 }
 
 impl crate::private::Sealed for DirectoryHandle {}
@@ -31,8 +35,21 @@ impl crate::private::Sealed for WritableFileStream {}
 
 impl FileHandle {
     fn new() -> Self {
-        Self(Rc::new(RefCell::new(Vec::new())))
+        Self(Arc::new(RwLock::new(Vec::new())))
     }
+}
+
+fn validate_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("name must not be empty".to_string());
+    }
+    if name == "." || name == ".." {
+        return Err(format!("'{}' is not a valid name", name));
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err(format!("'{}' contains path separators", name));
+    }
+    Ok(())
 }
 
 impl crate::DirectoryHandle for DirectoryHandle {
@@ -44,7 +61,8 @@ impl crate::DirectoryHandle for DirectoryHandle {
         name: &str,
         options: &crate::GetFileHandleOptions,
     ) -> Result<Self::FileHandleT, Self::Error> {
-        let mut directory = self.0.borrow_mut();
+        validate_name(name)?;
+        let mut directory = self.0.write().unwrap();
         let entry = match directory.entry(name.to_string()) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
             std::collections::hash_map::Entry::Vacant(entry) => {
@@ -69,7 +87,8 @@ impl crate::DirectoryHandle for DirectoryHandle {
         name: &str,
         options: &crate::GetDirectoryHandleOptions,
     ) -> Result<Self, Self::Error> {
-        let mut directory = self.0.borrow_mut();
+        validate_name(name)?;
+        let mut directory = self.0.write().unwrap();
         let entry = match directory.entry(name.to_string()) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
             std::collections::hash_map::Entry::Vacant(entry) => {
@@ -90,8 +109,11 @@ impl crate::DirectoryHandle for DirectoryHandle {
     }
 
     async fn remove_entry(&mut self, name: &str) -> Result<(), Self::Error> {
-        let mut directory = self.0.borrow_mut();
-        directory.remove(name);
+        validate_name(name)?;
+        let mut directory = self.0.write().unwrap();
+        if directory.remove(name).is_none() {
+            return Err(format!("'{name}' does not exist"));
+        }
         Ok(())
     }
 
@@ -100,12 +122,13 @@ impl crate::DirectoryHandle for DirectoryHandle {
         name: &str,
         options: &crate::FileSystemRemoveOptions,
     ) -> Result<(), Self::Error> {
-        let mut directory = self.0.borrow_mut();
+        validate_name(name)?;
+        let mut directory = self.0.write().unwrap();
 
         if let Some(entry) = directory.get(name) {
             match entry {
                 DirectoryEntry::Directory(dir) if !options.recursive => {
-                    if !dir.0.borrow().is_empty() {
+                    if !dir.0.read().unwrap().is_empty() {
                         return Err(format!("Directory '{}' is not empty", name));
                     }
                 }
@@ -113,7 +136,9 @@ impl crate::DirectoryHandle for DirectoryHandle {
             }
         }
 
-        directory.remove(name);
+        if directory.remove(name).is_none() {
+            return Err(format!("'{name}' does not exist"));
+        }
         Ok(())
     }
 
@@ -121,8 +146,7 @@ impl crate::DirectoryHandle for DirectoryHandle {
         &self,
     ) -> Result<impl Stream<Item = Result<(String, DirectoryEntry), Self::Error>>, Self::Error>
     {
-        // Making this lazy would hold the Ref guard across await points, causing runtime panics.
-        let directory = self.0.borrow();
+        let directory = self.0.read().unwrap();
         let entries: Vec<_> = directory
             .iter()
             .map(|(name, entry)| Ok((name.clone(), entry.clone())))
@@ -133,7 +157,7 @@ impl crate::DirectoryHandle for DirectoryHandle {
 }
 impl Default for DirectoryHandle {
     fn default() -> Self {
-        Self(Rc::new(RefCell::new(HashMap::new())))
+        Self(Arc::new(RwLock::new(HashMap::new())))
     }
 }
 
@@ -146,7 +170,7 @@ impl crate::FileHandle for FileHandle {
         options: &crate::CreateWritableOptions,
     ) -> Result<Self::WritableFileStreamT, Self::Error> {
         let staging = if options.keep_existing_data {
-            self.0.borrow().clone()
+            self.0.read().unwrap().clone()
         } else {
             Vec::new()
         };
@@ -154,11 +178,12 @@ impl crate::FileHandle for FileHandle {
             cursor_pos: 0,
             staging,
             target: self.0.clone(),
+            closed: false,
         })
     }
 
     async fn read(&self) -> Result<Vec<u8>, Self::Error> {
-        Ok(self.0.borrow().clone())
+        Ok(self.0.read().unwrap().clone())
     }
 
     async fn read_range<R: std::ops::RangeBounds<u64> + Send>(
@@ -167,7 +192,7 @@ impl crate::FileHandle for FileHandle {
     ) -> Result<Vec<u8>, Self::Error> {
         use std::ops::Bound;
 
-        let data = self.0.borrow();
+        let data = self.0.read().unwrap();
         let len = data.len() as u64;
 
         let start = match range.start_bound() {
@@ -195,7 +220,7 @@ impl crate::FileHandle for FileHandle {
     }
 
     async fn size(&self) -> Result<u64, Self::Error> {
-        Ok(self.0.borrow().len() as u64)
+        Ok(self.0.read().unwrap().len() as u64)
     }
 }
 
@@ -203,6 +228,9 @@ impl crate::WritableFileStream for WritableFileStream {
     type Error = String;
 
     async fn write_at_cursor_pos(&mut self, data: &[u8]) -> Result<(), Self::Error> {
+        if self.closed {
+            return Err("stream is closed".to_string());
+        }
         let data_len = data.len() as u64;
         let needed_len = self.cursor_pos + data_len;
         if needed_len > self.staging.len() as u64 {
@@ -215,6 +243,9 @@ impl crate::WritableFileStream for WritableFileStream {
     }
 
     async fn write_with_params(&mut self, params: &crate::WriteParams) -> Result<(), Self::Error> {
+        if self.closed {
+            return Err("stream is closed".to_string());
+        }
         use crate::WriteCommandType;
 
         match params.command_type {
@@ -228,6 +259,7 @@ impl crate::WritableFileStream for WritableFileStream {
                         }
                         let start = position as usize;
                         self.staging[start..start + data.len()].copy_from_slice(data);
+                        self.cursor_pos = position + data_len;
                     } else {
                         self.write_at_cursor_pos(data).await?;
                     }
@@ -254,6 +286,9 @@ impl crate::WritableFileStream for WritableFileStream {
     }
 
     async fn truncate(&mut self, size: u64) -> Result<(), Self::Error> {
+        if self.closed {
+            return Err("stream is closed".to_string());
+        }
         self.staging.resize(size as usize, 0);
         if self.cursor_pos > size {
             self.cursor_pos = size;
@@ -262,12 +297,19 @@ impl crate::WritableFileStream for WritableFileStream {
     }
 
     async fn close(&mut self) -> Result<(), Self::Error> {
+        if self.closed {
+            return Err("stream is closed".to_string());
+        }
+        self.closed = true;
         let staging = std::mem::take(&mut self.staging);
-        *self.target.borrow_mut() = staging;
+        *self.target.write().unwrap() = staging;
         Ok(())
     }
 
     async fn seek(&mut self, offset: u64) -> Result<(), Self::Error> {
+        if self.closed {
+            return Err("stream is closed".to_string());
+        }
         self.cursor_pos = offset;
         Ok(())
     }
@@ -337,6 +379,14 @@ mod tests {
             .get_file_handle_with_options("test.txt", &GetFileHandleOptions { create: false })
             .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_remove_entry_missing() {
+        let mut dir = DirectoryHandle::default();
+        let result = dir.remove_entry("nonexistent").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("does not exist"));
     }
 
     #[tokio::test]
@@ -480,27 +530,21 @@ mod tests {
         writer.write_at_cursor_pos(b"Hello, World!").await.unwrap();
         writer.close().await.unwrap();
 
-        // Read from start to middle using exclusive range
         let data = file.read_range(0..5).await.unwrap();
         assert_eq!(data, b"Hello");
 
-        // Read from middle to end using RangeFrom
         let data = file.read_range(7..).await.unwrap();
         assert_eq!(data, b"World!");
 
-        // Read a middle section
         let data = file.read_range(2..9).await.unwrap();
         assert_eq!(data, b"llo, Wo");
 
-        // Read beyond file size
         let data = file.read_range(100..).await.unwrap();
         assert_eq!(data, b"");
 
-        // Read using inclusive range
         let data = file.read_range(0..=4).await.unwrap();
         assert_eq!(data, b"Hello");
 
-        // Read everything using RangeFull
         let data = file.read_range(..).await.unwrap();
         assert_eq!(data, b"Hello, World!");
     }
@@ -551,7 +595,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Write at the beginning
         let params = WriteParams {
             command_type: WriteCommandType::Write,
             data: Some(b"Hello".to_vec()),
@@ -560,7 +603,6 @@ mod tests {
         };
         writer.write_with_params(&params).await.unwrap();
 
-        // Seek and write
         let params = WriteParams {
             command_type: WriteCommandType::Seek,
             data: None,
@@ -577,7 +619,6 @@ mod tests {
         };
         writer.write_with_params(&params).await.unwrap();
 
-        // Write at specific position
         let params = WriteParams {
             command_type: WriteCommandType::Write,
             data: Some(b"!".to_vec()),
@@ -590,5 +631,31 @@ mod tests {
 
         let data = file.read().await.unwrap();
         assert_eq!(data, b"!eXXX");
+    }
+
+    #[tokio::test]
+    async fn test_write_after_close_errors() {
+        let dir = DirectoryHandle::default();
+        let options = GetFileHandleOptions { create: true };
+
+        let mut file = dir
+            .get_file_handle_with_options("test.txt", &options)
+            .await
+            .unwrap();
+
+        let write_options = CreateWritableOptions {
+            keep_existing_data: false,
+        };
+        let mut writer = file
+            .create_writable_with_options(&write_options)
+            .await
+            .unwrap();
+
+        writer.write_at_cursor_pos(b"data").await.unwrap();
+        writer.close().await.unwrap();
+
+        let result = writer.write_at_cursor_pos(b"more").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("closed"));
     }
 }

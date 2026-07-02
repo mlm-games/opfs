@@ -302,8 +302,7 @@ impl File {
         Ok(vec)
     }
 
-    #[allow(dead_code)]
-    pub async fn text(&self) -> Result<String, JsValue> {
+    pub(crate) async fn text(&self) -> Result<String, JsValue> {
         JsFuture::from(self.0.text())
             .await?
             .as_string()
