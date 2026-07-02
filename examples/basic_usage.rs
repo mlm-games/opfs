@@ -15,7 +15,7 @@ use opfs::{DirectoryHandle as _, FileHandle as _, WritableFileStream as _};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get the app-specific directory (works on both native and web)
-    let dir: DirectoryHandle = app_specific_dir().await?;
+    let mut dir: DirectoryHandle = app_specific_dir().await?;
 
     // Create or get a file handle
     let options = GetFileHandleOptions { create: true };
@@ -26,6 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Write some data to the file
     let write_options = CreateWritableOptions {
         keep_existing_data: false,
+        mode: Default::default(),
     };
     let mut writer: WritableFileStream = file.create_writable_with_options(&write_options).await?;
 

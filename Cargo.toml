@@ -46,5 +46,5 @@ tokio = { version = "1.45.1", features = ["fs", "io-util", "sync", "macros", "rt
 dirs = "5.0"
 tempfile = "3.20"
 
-[target.'cfg(all(target_arch = "wasm32", test))'.dev-dependencies]
+[dev-dependencies]
 wasm-bindgen-test = "0.3"

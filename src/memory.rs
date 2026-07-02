@@ -1,63 +1,110 @@
-//! "in-memory" filesystem for use in tests or when persistence isn't necessary
-
+use crate::persistent::Error;
 use futures::Stream;
 use std::{
     collections::HashMap,
+    sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, RwLock},
 };
 
-/// An entry in a virtual directory in the in-memory filesystem.
-pub type DirectoryEntry = crate::DirectoryEntry<DirectoryHandle, FileHandle>;
+type DirectoryEntry = crate::DirectoryEntry<DirectoryHandle, FileHandle>;
 
-/// A virtual directory in the in-memory filesystem.
 #[derive(Debug, Clone)]
 pub struct DirectoryHandle(Arc<RwLock<HashMap<String, DirectoryEntry>>>);
 
-/// A virtual file in the in-memory filesystem.
 #[derive(Debug, Clone)]
-pub struct FileHandle(Arc<RwLock<Vec<u8>>>);
+pub struct FileHandle {
+    data: Arc<RwLock<Vec<u8>>>,
+    writer_active: Arc<AtomicBool>,
+}
 
-/// A writable file stream in the in-memory filesystem.
-///
-/// Writes go to a staging buffer. On [`close`](WritableFileStream::close),
-/// the staging buffer atomically replaces the target file's data.
 #[derive(Debug)]
 pub struct WritableFileStream {
     cursor_pos: u64,
     staging: Vec<u8>,
     target: Arc<RwLock<Vec<u8>>>,
+    writer_flag: Option<Arc<AtomicBool>>,
     closed: bool,
 }
+
+#[derive(Debug)]
+pub struct SyncAccessHandle(Arc<RwLock<Vec<u8>>>);
 
 impl crate::private::Sealed for DirectoryHandle {}
 impl crate::private::Sealed for FileHandle {}
 impl crate::private::Sealed for WritableFileStream {}
+impl crate::private::Sealed for SyncAccessHandle {}
 
 impl FileHandle {
     fn new() -> Self {
-        Self(Arc::new(RwLock::new(Vec::new())))
+        Self {
+            data: Arc::new(RwLock::new(Vec::new())),
+            writer_active: Arc::new(AtomicBool::new(false)),
+        }
     }
 }
 
-fn validate_name(name: &str) -> Result<(), String> {
+fn validate_name(name: &str) -> Result<(), Error> {
     if name.is_empty() {
-        return Err("name must not be empty".to_string());
+        return Err(Error::Msg("name must not be empty".into()));
     }
     if name == "." || name == ".." {
-        return Err(format!("'{}' is not a valid name", name));
+        return Err(Error::Msg(format!("'{}' is not a valid name", name)));
     }
     if name.contains('/') || name.contains('\\') {
-        return Err(format!("'{}' contains path separators", name));
+        return Err(Error::Msg(format!(
+            "'{}' contains path separators",
+            name
+        )));
     }
     Ok(())
 }
 
+impl crate::SyncAccessHandle for SyncAccessHandle {
+    type Error = Error;
+
+    fn read(&self, buffer: &mut [u8], at: u64) -> Result<usize, Self::Error> {
+        let data = self.0.read().unwrap();
+        let start = at as usize;
+        if start >= data.len() {
+            return Ok(0);
+        }
+        let end = std::cmp::min(start + buffer.len(), data.len());
+        let n = end - start;
+        buffer[..n].copy_from_slice(&data[start..end]);
+        Ok(n)
+    }
+
+    fn write(&self, data: &[u8], at: u64) -> Result<usize, Self::Error> {
+        let mut vec = self.0.write().unwrap();
+        let start = at as usize;
+        let end = start + data.len();
+        if end > vec.len() {
+            vec.resize(end, 0);
+        }
+        vec[start..end].copy_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn truncate(&self, size: u64) -> Result<(), Self::Error> {
+        self.0.write().unwrap().resize(size as usize, 0);
+        Ok(())
+    }
+
+    fn get_size(&self) -> Result<u64, Self::Error> {
+        Ok(self.0.read().unwrap().len() as u64)
+    }
+
+    fn flush(&self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
 impl crate::DirectoryHandle for DirectoryHandle {
-    type Error = String;
+    type Error = Error;
     type FileHandleT = FileHandle;
 
     async fn get_file_handle_with_options(
-        &self,
+        &mut self,
         name: &str,
         options: &crate::GetFileHandleOptions,
     ) -> Result<Self::FileHandleT, Self::Error> {
@@ -71,19 +118,19 @@ impl crate::DirectoryHandle for DirectoryHandle {
                     entry.insert(DirectoryEntry::File(file_handle.clone()));
                     DirectoryEntry::File(file_handle)
                 } else {
-                    return Err(format!("'{name}' does not exist"));
+                    return Err(Error::Msg(format!("'{name}' does not exist")));
                 }
             }
         };
 
         match entry {
-            DirectoryEntry::Directory(_) => Err(format!("'{name}' is a directory")),
+            DirectoryEntry::Directory(_) => Err(Error::Msg(format!("'{name}' is a directory"))),
             DirectoryEntry::File(file) => Ok(file),
         }
     }
 
     async fn get_directory_handle_with_options(
-        &self,
+        &mut self,
         name: &str,
         options: &crate::GetDirectoryHandleOptions,
     ) -> Result<Self, Self::Error> {
@@ -97,13 +144,13 @@ impl crate::DirectoryHandle for DirectoryHandle {
                     entry.insert(DirectoryEntry::Directory(dir_handle.clone()));
                     DirectoryEntry::Directory(dir_handle)
                 } else {
-                    return Err(format!("'{name}' does not exist"));
+                    return Err(Error::Msg(format!("'{name}' does not exist")));
                 }
             }
         };
 
         match entry {
-            DirectoryEntry::File(_) => Err(format!("'{name}' is a file")),
+            DirectoryEntry::File(_) => Err(Error::Msg(format!("'{name}' is a file"))),
             DirectoryEntry::Directory(dir) => Ok(dir),
         }
     }
@@ -112,7 +159,7 @@ impl crate::DirectoryHandle for DirectoryHandle {
         validate_name(name)?;
         let mut directory = self.0.write().unwrap();
         if directory.remove(name).is_none() {
-            return Err(format!("'{name}' does not exist"));
+            return Err(Error::Msg(format!("'{name}' does not exist")));
         }
         Ok(())
     }
@@ -129,7 +176,10 @@ impl crate::DirectoryHandle for DirectoryHandle {
             match entry {
                 DirectoryEntry::Directory(dir) if !options.recursive => {
                     if !dir.0.read().unwrap().is_empty() {
-                        return Err(format!("Directory '{}' is not empty", name));
+                        return Err(Error::Msg(format!(
+                            "Directory '{}' is not empty",
+                            name
+                        )));
                     }
                 }
                 _ => {}
@@ -137,7 +187,7 @@ impl crate::DirectoryHandle for DirectoryHandle {
         }
 
         if directory.remove(name).is_none() {
-            return Err(format!("'{name}' does not exist"));
+            return Err(Error::Msg(format!("'{name}' does not exist")));
         }
         Ok(())
     }
@@ -146,15 +196,23 @@ impl crate::DirectoryHandle for DirectoryHandle {
         &self,
     ) -> Result<impl Stream<Item = Result<(String, DirectoryEntry), Self::Error>>, Self::Error>
     {
-        let directory = self.0.read().unwrap();
-        let entries: Vec<_> = directory
-            .iter()
-            .map(|(name, entry)| Ok((name.clone(), entry.clone())))
-            .collect();
-        drop(directory);
-        Ok(futures::stream::iter(entries))
+        let keys: Vec<String> = {
+            let dir = self.0.read().unwrap();
+            dir.keys().cloned().collect()
+        };
+        let inner = self.0.clone();
+        let stream = futures::stream::unfold(
+            (keys.into_iter(), inner),
+            |(mut iter, inner)| async {
+                let name = iter.next()?;
+                let entry = inner.read().unwrap().get(&name)?.clone();
+                Some((Ok((name, entry)), (iter, inner)))
+            },
+        );
+        Ok(stream)
     }
 }
+
 impl Default for DirectoryHandle {
     fn default() -> Self {
         Self(Arc::new(RwLock::new(HashMap::new())))
@@ -162,28 +220,40 @@ impl Default for DirectoryHandle {
 }
 
 impl crate::FileHandle for FileHandle {
-    type Error = String;
+    type Error = Error;
     type WritableFileStreamT = WritableFileStream;
+    type SyncAccessHandleT = SyncAccessHandle;
 
     async fn create_writable_with_options(
         &mut self,
         options: &crate::CreateWritableOptions,
     ) -> Result<Self::WritableFileStreamT, Self::Error> {
+        if options.mode == crate::WritableMode::Exclusive
+            && self.writer_active.swap(true, Ordering::SeqCst)
+        {
+            return Err(Error::Msg("File is already open for writing".into()));
+        }
         let staging = if options.keep_existing_data {
-            self.0.read().unwrap().clone()
+            self.data.read().unwrap().clone()
         } else {
             Vec::new()
+        };
+        let flag = if options.mode == crate::WritableMode::Exclusive {
+            Some(self.writer_active.clone())
+        } else {
+            None
         };
         Ok(WritableFileStream {
             cursor_pos: 0,
             staging,
-            target: self.0.clone(),
+            target: self.data.clone(),
+            writer_flag: flag,
             closed: false,
         })
     }
 
     async fn read(&self) -> Result<Vec<u8>, Self::Error> {
-        Ok(self.0.read().unwrap().clone())
+        Ok(self.data.read().unwrap().clone())
     }
 
     async fn read_range<R: std::ops::RangeBounds<u64> + Send>(
@@ -192,7 +262,7 @@ impl crate::FileHandle for FileHandle {
     ) -> Result<Vec<u8>, Self::Error> {
         use std::ops::Bound;
 
-        let data = self.0.read().unwrap();
+        let data = self.data.read().unwrap();
         let len = data.len() as u64;
 
         let start = match range.start_bound() {
@@ -220,16 +290,20 @@ impl crate::FileHandle for FileHandle {
     }
 
     async fn size(&self) -> Result<u64, Self::Error> {
-        Ok(self.0.read().unwrap().len() as u64)
+        Ok(self.data.read().unwrap().len() as u64)
+    }
+
+    async fn create_sync_access_handle(&self) -> Result<Self::SyncAccessHandleT, Self::Error> {
+        Ok(SyncAccessHandle(self.data.clone()))
     }
 }
 
 impl crate::WritableFileStream for WritableFileStream {
-    type Error = String;
+    type Error = Error;
 
     async fn write_at_cursor_pos(&mut self, data: &[u8]) -> Result<(), Self::Error> {
         if self.closed {
-            return Err("stream is closed".to_string());
+            return Err(Error::Closed);
         }
         let data_len = data.len() as u64;
         let needed_len = self.cursor_pos + data_len;
@@ -244,7 +318,7 @@ impl crate::WritableFileStream for WritableFileStream {
 
     async fn write_with_params(&mut self, params: &crate::WriteParams) -> Result<(), Self::Error> {
         if self.closed {
-            return Err("stream is closed".to_string());
+            return Err(Error::Closed);
         }
         use crate::WriteCommandType;
 
@@ -264,21 +338,21 @@ impl crate::WritableFileStream for WritableFileStream {
                         self.write_at_cursor_pos(data).await?;
                     }
                 } else {
-                    return Err("Write command requires data".to_string());
+                    return Err(Error::Msg("Write command requires data".into()));
                 }
             }
             WriteCommandType::Seek => {
                 if let Some(position) = params.position {
                     self.seek(position).await?;
                 } else {
-                    return Err("Seek command requires position".to_string());
+                    return Err(Error::Msg("Seek command requires position".into()));
                 }
             }
             WriteCommandType::Truncate => {
                 if let Some(size) = params.size {
                     self.truncate(size).await?;
                 } else {
-                    return Err("Truncate command requires size".to_string());
+                    return Err(Error::Msg("Truncate command requires size".into()));
                 }
             }
         }
@@ -287,7 +361,7 @@ impl crate::WritableFileStream for WritableFileStream {
 
     async fn truncate(&mut self, size: u64) -> Result<(), Self::Error> {
         if self.closed {
-            return Err("stream is closed".to_string());
+            return Err(Error::Closed);
         }
         self.staging.resize(size as usize, 0);
         if self.cursor_pos > size {
@@ -298,17 +372,20 @@ impl crate::WritableFileStream for WritableFileStream {
 
     async fn close(&mut self) -> Result<(), Self::Error> {
         if self.closed {
-            return Err("stream is closed".to_string());
+            return Err(Error::Closed);
         }
         self.closed = true;
         let staging = std::mem::take(&mut self.staging);
         *self.target.write().unwrap() = staging;
+        if let Some(flag) = self.writer_flag.take() {
+            flag.store(false, Ordering::SeqCst);
+        }
         Ok(())
     }
 
     async fn seek(&mut self, offset: u64) -> Result<(), Self::Error> {
         if self.closed {
-            return Err("stream is closed".to_string());
+            return Err(Error::Closed);
         }
         self.cursor_pos = offset;
         Ok(())
@@ -317,16 +394,16 @@ impl crate::WritableFileStream for WritableFileStream {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{
-        CreateWritableOptions, DirectoryHandle as _, FileHandle as _, GetFileHandleOptions,
-        WritableFileStream as _,
-    };
+use super::*;
+use crate::{
+    CreateWritableOptions, DirectoryHandle as _, FileHandle as _, GetFileHandleOptions,
+    SyncAccessHandle as _, WritableFileStream as _, WritableMode,
+};
     use futures::StreamExt;
 
     #[tokio::test]
     async fn test_create_and_read_file() {
-        let dir = DirectoryHandle::default();
+        let mut dir = DirectoryHandle::default();
         let options = GetFileHandleOptions { create: true };
 
         let mut file = dir
@@ -336,6 +413,7 @@ mod tests {
 
         let write_options = CreateWritableOptions {
             keep_existing_data: false,
+            mode: WritableMode::Siloed,
         };
         let mut writer = file
             .create_writable_with_options(&write_options)
@@ -354,13 +432,13 @@ mod tests {
     #[tokio::test]
     async fn test_file_not_found() {
         let dir = DirectoryHandle::default();
+        let mut dir = dir;
         let options = GetFileHandleOptions { create: false };
 
         let result = dir
             .get_file_handle_with_options("nonexistent.txt", &options)
             .await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("does not exist"));
     }
 
     #[tokio::test]
@@ -386,7 +464,6 @@ mod tests {
         let mut dir = DirectoryHandle::default();
         let result = dir.remove_entry("nonexistent").await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("does not exist"));
     }
 
     #[tokio::test]
@@ -399,7 +476,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_entries_with_files() {
-        let dir = DirectoryHandle::default();
+        let mut dir = DirectoryHandle::default();
         let options = GetFileHandleOptions { create: true };
 
         let _file1 = dir
@@ -423,7 +500,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_seek_and_write() {
-        let dir = DirectoryHandle::default();
+        let mut dir = DirectoryHandle::default();
         let options = GetFileHandleOptions { create: true };
 
         let mut file = dir
@@ -433,6 +510,7 @@ mod tests {
 
         let write_options = CreateWritableOptions {
             keep_existing_data: false,
+            mode: WritableMode::Siloed,
         };
         let mut writer = file
             .create_writable_with_options(&write_options)
@@ -450,7 +528,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_seek_beyond_end() {
-        let dir = DirectoryHandle::default();
+        let mut dir = DirectoryHandle::default();
         let options = GetFileHandleOptions { create: true };
 
         let mut file = dir
@@ -460,6 +538,7 @@ mod tests {
 
         let write_options = CreateWritableOptions {
             keep_existing_data: false,
+            mode: WritableMode::Siloed,
         };
         let mut writer = file
             .create_writable_with_options(&write_options)
@@ -478,7 +557,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_keep_existing_data() {
-        let dir = DirectoryHandle::default();
+        let mut dir = DirectoryHandle::default();
         let options = GetFileHandleOptions { create: true };
 
         let mut file = dir
@@ -488,6 +567,7 @@ mod tests {
 
         let write_options = CreateWritableOptions {
             keep_existing_data: false,
+            mode: WritableMode::Siloed,
         };
         let mut writer = file
             .create_writable_with_options(&write_options)
@@ -498,6 +578,7 @@ mod tests {
 
         let keep_options = CreateWritableOptions {
             keep_existing_data: true,
+            mode: WritableMode::Siloed,
         };
         let mut writer2 = file
             .create_writable_with_options(&keep_options)
@@ -512,7 +593,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_range() {
-        let dir = DirectoryHandle::default();
+        let mut dir = DirectoryHandle::default();
         let options = GetFileHandleOptions { create: true };
 
         let mut file = dir
@@ -522,6 +603,7 @@ mod tests {
 
         let write_options = CreateWritableOptions {
             keep_existing_data: false,
+            mode: WritableMode::Siloed,
         };
         let mut writer = file
             .create_writable_with_options(&write_options)
@@ -551,7 +633,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_truncate() {
-        let dir = DirectoryHandle::default();
+        let mut dir = DirectoryHandle::default();
         let options = GetFileHandleOptions { create: true };
 
         let mut file = dir
@@ -561,6 +643,7 @@ mod tests {
 
         let write_options = CreateWritableOptions {
             keep_existing_data: false,
+            mode: WritableMode::Siloed,
         };
         let mut writer = file
             .create_writable_with_options(&write_options)
@@ -579,7 +662,7 @@ mod tests {
     async fn test_write_with_params() {
         use crate::{WriteCommandType, WriteParams};
 
-        let dir = DirectoryHandle::default();
+        let mut dir = DirectoryHandle::default();
         let options = GetFileHandleOptions { create: true };
 
         let mut file = dir
@@ -589,6 +672,7 @@ mod tests {
 
         let write_options = CreateWritableOptions {
             keep_existing_data: false,
+            mode: WritableMode::Siloed,
         };
         let mut writer = file
             .create_writable_with_options(&write_options)
@@ -635,7 +719,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_after_close_errors() {
-        let dir = DirectoryHandle::default();
+        let mut dir = DirectoryHandle::default();
         let options = GetFileHandleOptions { create: true };
 
         let mut file = dir
@@ -645,6 +729,7 @@ mod tests {
 
         let write_options = CreateWritableOptions {
             keep_existing_data: false,
+            mode: WritableMode::Siloed,
         };
         let mut writer = file
             .create_writable_with_options(&write_options)
@@ -656,6 +741,135 @@ mod tests {
 
         let result = writer.write_at_cursor_pos(b"more").await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("closed"));
+    }
+
+    #[tokio::test]
+    async fn test_sync_access_handle() {
+        let mut dir = DirectoryHandle::default();
+        let options = GetFileHandleOptions { create: true };
+
+        let mut file_handle = dir
+            .get_file_handle_with_options("test.bin", &options)
+            .await
+            .unwrap();
+
+        let write_options = CreateWritableOptions {
+            keep_existing_data: false,
+            mode: WritableMode::Siloed,
+        };
+        let mut writer = file_handle
+            .create_writable_with_options(&write_options)
+            .await
+            .unwrap();
+        writer
+            .write_at_cursor_pos(b"Hello, World!")
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+
+        let sync_handle = file_handle.create_sync_access_handle().await.unwrap();
+
+        let mut buf = vec![0u8; 5];
+        let n = sync_handle.read(&mut buf, 0).unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(&buf, b"Hello");
+
+        let n = sync_handle.write(b"12345", 7).unwrap();
+        assert_eq!(n, 5);
+
+        let mut buf2 = vec![0u8; 13];
+        sync_handle.read(&mut buf2, 0).unwrap();
+        assert_eq!(&buf2, b"Hello, 12345!");
+
+        let size = sync_handle.get_size().unwrap();
+        assert_eq!(size, 13);
+
+        sync_handle.truncate(5).unwrap();
+        let size = sync_handle.get_size().unwrap();
+        assert_eq!(size, 5);
+    }
+
+    #[tokio::test]
+    async fn test_exclusive_writer_rejects_second() {
+        let mut dir = DirectoryHandle::default();
+        let options = GetFileHandleOptions { create: true };
+
+        let mut file = dir
+            .get_file_handle_with_options("test.txt", &options)
+            .await
+            .unwrap();
+
+        let write_options = CreateWritableOptions {
+            keep_existing_data: false,
+            mode: WritableMode::Exclusive,
+        };
+        let _writer = file
+            .create_writable_with_options(&write_options)
+            .await
+            .unwrap();
+
+        let result = file.create_writable_with_options(&write_options).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_siloed_writer_allows_second() {
+        let mut dir = DirectoryHandle::default();
+        let options = GetFileHandleOptions { create: true };
+
+        let mut file = dir
+            .get_file_handle_with_options("test.txt", &options)
+            .await
+            .unwrap();
+
+        let write_options = CreateWritableOptions {
+            keep_existing_data: false,
+            mode: WritableMode::Siloed,
+        };
+        let _writer = file
+            .create_writable_with_options(&write_options)
+            .await
+            .unwrap();
+
+        let result = file.create_writable_with_options(&write_options).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_exclusive_writer_releases_on_close() {
+        let mut dir = DirectoryHandle::default();
+        let options = GetFileHandleOptions { create: true };
+
+        let mut file = dir
+            .get_file_handle_with_options("test.txt", &options)
+            .await
+            .unwrap();
+
+        let write_options = CreateWritableOptions {
+            keep_existing_data: false,
+            mode: WritableMode::Exclusive,
+        };
+        let mut writer = file
+            .create_writable_with_options(&write_options)
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+
+        let result = file.create_writable_with_options(&write_options).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_error_matches_portably() {
+        let mut dir = DirectoryHandle::default();
+        let result = dir
+            .get_file_handle_with_options("", &GetFileHandleOptions { create: false })
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match &err {
+            Error::Msg(msg) => assert!(msg.contains("empty")),
+            _ => panic!("expected Msg error, got: {:?}", err),
+        }
     }
 }

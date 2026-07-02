@@ -9,7 +9,7 @@ use opfs::{
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get the app-specific directory
-    let dir: DirectoryHandle = app_specific_dir().await?;
+    let mut dir: DirectoryHandle = app_specific_dir().await?;
 
     // Create a file
     let options = GetFileHandleOptions { create: true };
@@ -20,6 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Write some initial content
     let write_options = CreateWritableOptions {
         keep_existing_data: false,
+        mode: Default::default(),
     };
     let mut writer = file.create_writable_with_options(&write_options).await?;
 
@@ -62,6 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut writer = file
         .create_writable_with_options(&CreateWritableOptions {
             keep_existing_data: true,
+            mode: Default::default(),
         })
         .await?;
 
