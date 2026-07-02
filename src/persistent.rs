@@ -4,7 +4,71 @@ pub use crate::web::{DirectoryHandle, FileHandle, WritableFileStream};
 #[cfg(not(target_arch = "wasm32"))]
 pub use crate::native::{DirectoryHandle, FileHandle, WritableFileStream};
 
-pub type Error = <DirectoryHandle as crate::DirectoryHandle>::Error;
+#[cfg(target_arch = "wasm32")]
+pub use crate::web::SyncAccessHandle;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use crate::native::SyncAccessHandle;
+
+#[derive(Debug)]
+pub enum Error {
+    #[cfg(not(target_arch = "wasm32"))]
+    Io(std::io::Error),
+    #[cfg(target_arch = "wasm32")]
+    Js(wasm_bindgen::JsValue),
+    Msg(String),
+    Closed,
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Error::Io(e) => write!(f, "I/O error: {}", e),
+            #[cfg(target_arch = "wasm32")]
+            Error::Js(e) => write!(f, "JavaScript error: {:?}", e),
+            Error::Msg(msg) => write!(f, "{}", msg),
+            Error::Closed => write!(f, "stream is closed"),
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<String> for Error {
+    fn from(msg: String) -> Self {
+        Error::Msg(msg)
+    }
+}
+
+impl From<&str> for Error {
+    fn from(msg: &str) -> Self {
+        Error::Msg(msg.to_string())
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Error::Io(e)
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl From<wasm_bindgen::JsValue> for Error {
+    fn from(e: wasm_bindgen::JsValue) -> Self {
+        Error::Js(e)
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Returns a directory handle for app-specific data storage.
@@ -20,9 +84,7 @@ pub async fn app_specific_dir() -> Result<DirectoryHandle> {
     use web_sys::FileSystemDirectoryHandle;
 
     let window = web_sys::window().ok_or_else(|| {
-        let msg = wasm_bindgen::JsValue::from_str("No window object");
-        let err: <DirectoryHandle as crate::DirectoryHandle>::Error = msg;
-        err
+        Error::Msg("No window object".to_string())
     })?;
     let navigator = window.navigator();
 
