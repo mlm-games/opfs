@@ -69,14 +69,14 @@ impl crate::SyncAccessHandle for SyncAccessHandle {
 
     fn read(&self, buffer: &mut [u8], at: u64) -> Result<usize, Self::Error> {
         let options = FileSystemReadWriteOptions::new();
-        options.set_at(at);
+        options.set_at(at as f64);
         let n = self.0.read_with_u8_array_and_options(buffer, &options)?;
         Ok(n as usize)
     }
 
     fn write(&self, data: &[u8], at: u64) -> Result<usize, Self::Error> {
         let options = FileSystemReadWriteOptions::new();
-        options.set_at(at);
+        options.set_at(at as f64);
         let n = self.0.write_with_u8_array_and_options(data, &options)?;
         Ok(n as usize)
     }
