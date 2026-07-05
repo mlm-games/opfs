@@ -12,7 +12,6 @@ pub use crate::native::SyncAccessHandle;
 
 #[derive(Debug)]
 pub enum Error {
-    #[cfg(not(target_arch = "wasm32"))]
     Io(std::io::Error),
     #[cfg(target_arch = "wasm32")]
     Js(wasm_bindgen::JsValue),
@@ -23,7 +22,6 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
             Error::Io(e) => write!(f, "I/O error: {}", e),
             #[cfg(target_arch = "wasm32")]
             Error::Js(e) => write!(f, "JavaScript error: {:?}", e),
@@ -34,7 +32,6 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {
-    #[cfg(not(target_arch = "wasm32"))]
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Io(e) => Some(e),
@@ -55,7 +52,6 @@ impl From<&str> for Error {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
         Error::Io(e)
