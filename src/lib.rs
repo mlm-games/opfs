@@ -49,6 +49,7 @@
 
 pub mod memory;
 pub mod persistent;
+pub mod sync;
 
 #[cfg(target_arch = "wasm32")]
 pub mod web;
