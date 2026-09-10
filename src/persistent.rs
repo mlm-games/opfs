@@ -12,6 +12,14 @@ pub use crate::native::SyncAccessHandle;
 
 #[derive(Debug)]
 pub enum Error {
+    /// A file or directory in the path does not exist.
+    NotFound(String),
+    /// A file or directory already exists where creation was requested.
+    AlreadyExists(String),
+    /// A handle of the wrong type (file vs directory) was requested.
+    TypeMismatch(String),
+    /// An entry name is empty, `.`/`..`, or contains a path separator.
+    InvalidName(String),
     Io(std::io::Error),
     #[cfg(target_arch = "wasm32")]
     Js(wasm_bindgen::JsValue),
@@ -19,9 +27,26 @@ pub enum Error {
     Closed,
 }
 
+impl Error {
+    /// Returns `true` for missing-file/directory errors, so callers can
+    /// distinguish "does not exist" from real failures (permission, quota,
+    /// type mismatch, internal errors, ...).
+    pub fn is_not_found(&self) -> bool {
+        match self {
+            Error::NotFound(_) => true,
+            Error::Io(e) => e.kind() == std::io::ErrorKind::NotFound,
+            _ => false,
+        }
+    }
+}
+
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Error::NotFound(name) => write!(f, "'{name}' does not exist"),
+            Error::AlreadyExists(name) => write!(f, "'{name}' already exists"),
+            Error::TypeMismatch(msg) => write!(f, "{msg}"),
+            Error::InvalidName(msg) => write!(f, "{msg}"),
             Error::Io(e) => write!(f, "I/O error: {}", e),
             #[cfg(target_arch = "wasm32")]
             Error::Js(e) => write!(f, "JavaScript error: {:?}", e),
@@ -54,7 +79,11 @@ impl From<&str> for Error {
 
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
-        Error::Io(e)
+        if e.kind() == std::io::ErrorKind::NotFound {
+            Error::NotFound(e.to_string())
+        } else {
+            Error::Io(e)
+        }
     }
 }
 

@@ -1,5 +1,5 @@
 use crate::persistent::Error;
-use futures::Stream;
+use futures_core::Stream;
 use std::{
     collections::HashMap,
     sync::atomic::{AtomicBool, Ordering},
@@ -45,13 +45,15 @@ impl FileHandle {
 
 fn validate_name(name: &str) -> Result<(), Error> {
     if name.is_empty() {
-        return Err(Error::Msg("name must not be empty".into()));
+        return Err(Error::InvalidName("name must not be empty".into()));
     }
     if name == "." || name == ".." {
-        return Err(Error::Msg(format!("'{}' is not a valid name", name)));
+        return Err(Error::InvalidName(format!("'{name}' is not a valid name")));
     }
     if name.contains('/') || name.contains('\\') {
-        return Err(Error::Msg(format!("'{}' contains path separators", name)));
+        return Err(Error::InvalidName(format!(
+            "'{name}' contains path separators"
+        )));
     }
     Ok(())
 }
@@ -115,13 +117,15 @@ impl crate::DirectoryHandle for DirectoryHandle {
                     entry.insert(DirectoryEntry::File(file_handle.clone()));
                     DirectoryEntry::File(file_handle)
                 } else {
-                    return Err(Error::Msg(format!("'{name}' does not exist")));
+                    return Err(Error::NotFound(name.to_string()));
                 }
             }
         };
 
         match entry {
-            DirectoryEntry::Directory(_) => Err(Error::Msg(format!("'{name}' is a directory"))),
+            DirectoryEntry::Directory(_) => {
+                Err(Error::TypeMismatch(format!("'{name}' is a directory")))
+            }
             DirectoryEntry::File(file) => Ok(file),
         }
     }
@@ -141,13 +145,13 @@ impl crate::DirectoryHandle for DirectoryHandle {
                     entry.insert(DirectoryEntry::Directory(dir_handle.clone()));
                     DirectoryEntry::Directory(dir_handle)
                 } else {
-                    return Err(Error::Msg(format!("'{name}' does not exist")));
+                    return Err(Error::NotFound(name.to_string()));
                 }
             }
         };
 
         match entry {
-            DirectoryEntry::File(_) => Err(Error::Msg(format!("'{name}' is a file"))),
+            DirectoryEntry::File(_) => Err(Error::TypeMismatch(format!("'{name}' is a file"))),
             DirectoryEntry::Directory(dir) => Ok(dir),
         }
     }
@@ -156,7 +160,7 @@ impl crate::DirectoryHandle for DirectoryHandle {
         validate_name(name)?;
         let mut directory = self.0.write().unwrap();
         if directory.remove(name).is_none() {
-            return Err(Error::Msg(format!("'{name}' does not exist")));
+            return Err(Error::NotFound(name.to_string()));
         }
         Ok(())
     }
@@ -181,7 +185,7 @@ impl crate::DirectoryHandle for DirectoryHandle {
         }
 
         if directory.remove(name).is_none() {
-            return Err(Error::Msg(format!("'{name}' does not exist")));
+            return Err(Error::NotFound(name.to_string()));
         }
         Ok(())
     }
@@ -196,7 +200,7 @@ impl crate::DirectoryHandle for DirectoryHandle {
         };
         let inner = self.0.clone();
         let stream =
-            futures::stream::unfold((keys.into_iter(), inner), |(mut iter, inner)| async {
+            futures_util::stream::unfold((keys.into_iter(), inner), |(mut iter, inner)| async {
                 let name = iter.next()?;
                 let entry = inner.read().unwrap().get(&name)?.clone();
                 Some((Ok((name, entry)), (iter, inner)))
@@ -385,6 +389,18 @@ impl crate::WritableFileStream for WritableFileStream {
     }
 }
 
+impl Drop for WritableFileStream {
+    /// A stream dropped without `close()` frees the exclusive lock instead
+    /// of leaking it (staged data is discarded). Handles cloned from the
+    /// same directory tree already share the underlying `writer_active`
+    /// flag, so exclusivity holds across handles.
+    fn drop(&mut self) {
+        if let Some(flag) = self.writer_flag.take() {
+            flag.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,7 +408,7 @@ mod tests {
         CreateWritableOptions, DirectoryHandle as _, FileHandle as _, GetFileHandleOptions,
         SyncAccessHandle as _, WritableFileStream as _, WritableMode,
     };
-    use futures::StreamExt;
+    use futures_util::StreamExt;
 
     #[tokio::test]
     async fn test_create_and_read_file() {
@@ -850,6 +866,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_exclusive_writer_rejects_across_handles() {
+        let mut dir = DirectoryHandle::default();
+        let options = GetFileHandleOptions { create: true };
+
+        let mut file1 = dir
+            .get_file_handle_with_options("test.txt", &options)
+            .await
+            .unwrap();
+        let mut file2 = dir
+            .get_file_handle_with_options("test.txt", &options)
+            .await
+            .unwrap();
+
+        let write_options = CreateWritableOptions {
+            keep_existing_data: false,
+            mode: WritableMode::Exclusive,
+        };
+        let _writer = file1
+            .create_writable_with_options(&write_options)
+            .await
+            .unwrap();
+
+        let result = file2.create_writable_with_options(&write_options).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_exclusive_writer_releases_on_drop() {
+        let mut dir = DirectoryHandle::default();
+        let options = GetFileHandleOptions { create: true };
+
+        let mut file = dir
+            .get_file_handle_with_options("test.txt", &options)
+            .await
+            .unwrap();
+
+        let write_options = CreateWritableOptions {
+            keep_existing_data: false,
+            mode: WritableMode::Exclusive,
+        };
+        let writer = file
+            .create_writable_with_options(&write_options)
+            .await
+            .unwrap();
+        drop(writer);
+
+        let result = file.create_writable_with_options(&write_options).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
     async fn test_error_matches_portably() {
         let mut dir = DirectoryHandle::default();
         let result = dir
@@ -858,8 +925,8 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         match &err {
-            Error::Msg(msg) => assert!(msg.contains("empty")),
-            _ => panic!("expected Msg error, got: {:?}", err),
+            Error::InvalidName(msg) => assert!(msg.contains("empty")),
+            _ => panic!("expected InvalidName error, got: {:?}", err),
         }
     }
 }

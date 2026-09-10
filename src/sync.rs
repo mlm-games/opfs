@@ -1,4 +1,10 @@
-//! Synchronous filesystem for wasm32, mirroring `std::fs`.
+//! Synchronous filesystem mirroring `std::fs`.
+//!
+//! **Backend note:** on native targets this delegates to the real filesystem.
+//! On `wasm32` this is a `localStorage`-backed shim — it is **not** OPFS
+//! (no `FileSystemSyncAccessHandle`, ~5 MB quota, string-only storage with
+//! base64-encoded values). Do not mistake it for durable/private
+//! origin storage; prefer the async [`crate::web`] OPFS backend on the web.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -6,6 +12,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use web_time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(target_arch = "wasm32")]
+use base64::Engine as _;
 
 #[derive(Debug, Clone, Default)]
 struct MemoryInner {
@@ -22,6 +31,10 @@ fn now_secs() -> u64 {
 }
 
 /// Synchronous storage that mirrors `std::fs` on native and `localStorage` on wasm.
+///
+/// **Wasm caveat:** the browser backend persists through `localStorage`
+/// (base64-encoded), not OPFS. It is suitable for small settings-like blobs,
+/// not for large or strictly durable data.
 /// Clone shares the same underlying map (like `FsStorage` sharing the real FS).
 #[derive(Debug, Clone, Default)]
 pub struct Fs {
@@ -81,18 +94,26 @@ impl Fs {
             }
             if let Ok(Some(v)) = ls.get_item(&key) {
                 let path = PathBuf::from(&key[Self::ls_prefix().len()..]);
-                let _ = self.write(&path, v.as_bytes());
-                // write() already mirrors to ls, but hydrate is the first load, so avoid double
-                // The write above will re-set ls item; that's fine.
+                let _ = self.write(&path, &Self::ls_decode(&v));
             }
         }
+    }
+
+    /// Decode a `localStorage` value. Current values are base64; very old
+    /// entries written as raw lossy-UTF8 fall back to their raw bytes so a
+    /// stale cache never becomes unreadable.
+    #[cfg(target_arch = "wasm32")]
+    fn ls_decode(s: &str) -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD
+            .decode(s)
+            .unwrap_or_else(|_| s.as_bytes().to_vec())
     }
 
     #[cfg(target_arch = "wasm32")]
     fn ls_set(path: &Path, data: &[u8]) {
         if let Some(ls) = Self::local_storage() {
             let key = Self::to_ls_key(path);
-            let s = String::from_utf8_lossy(data).into_owned();
+            let s = base64::engine::general_purpose::STANDARD.encode(data);
             let _ = ls.set_item(&key, &s);
         }
     }
@@ -324,7 +345,7 @@ impl Fs {
         if let Some(ls) = Self::local_storage() {
             let key = Self::to_ls_key(path);
             if let Ok(Some(s)) = ls.get_item(&key) {
-                let b = s.into_bytes();
+                let b = Self::ls_decode(&s);
                 let mut g = self.inner.write().unwrap();
                 g.files.insert(Self::normalize(path), b.clone());
                 g.mtimes.insert(Self::normalize(path), now_secs());
@@ -469,28 +490,9 @@ impl Fs {
     }
     pub fn remove_file(&self, path: &Path) -> io::Result<()> {
         let mut g = self.inner.write().unwrap();
-        let existed = g.files.remove(&Self::normalize(path)).is_some();
+        g.files.remove(&Self::normalize(path));
         g.mtimes.remove(&Self::normalize(path));
         Self::ls_remove(path);
-        if existed {
-            return Ok(());
-        }
-        // if not in memory but in ls, consider success (we just removed)
-        if Self::ls_exists(path) {
-            // ls_remove already did, but we checked after removal, so false
-            // Instead check before removal? For simplicity treat NotFound as success if ls had it
-            return Ok(());
-        }
-        // if neither, return NotFound but callers handle missing as ok in some places; keep Ok for wasm
-        // To preserve trait contract, return NotFound only if truly missing
-        // Since we already removed ls, we can't tell, so return Ok.
-        // The original impl returned NotFound, but for wasm we want idempotent.
-        // We'll return NotFound if neither existed before.
-        // We lost info, so just return Ok if we attempted removal.
-        // To be correct, check existence before: we already have existed flag.
-        // If not existed and not in ls before, we should return NotFound.
-        // But we removed ls before checking, so we need to check before.
-        // Simpler: if not existed, return Ok (idempotent) – SaveStore handles NotFound as ok for delete.
         Ok(())
     }
     pub fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
@@ -542,7 +544,7 @@ impl Fs {
         if let Some(ls) = Self::local_storage() {
             let key = Self::to_ls_key(path);
             if let Ok(Some(v)) = ls.get_item(&key) {
-                return Some(v.len() as u64);
+                return Some(Self::ls_decode(&v).len() as u64);
             }
         }
         None
@@ -619,4 +621,29 @@ impl Fs {
     }
     pub fn sync_file(&self, _path: &Path) {}
     pub fn sync_dir(&self, _path: &Path) {}
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_binary_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = Fs::new();
+        let path = dir.path().join("blob.bin");
+        let data: Vec<u8> = (0u8..=255u8).collect();
+        fs.write(&path, &data).unwrap();
+        assert_eq!(fs.read(&path).unwrap(), Some(data.clone()));
+        assert_eq!(fs.metadata_len(&path), Some(256));
+
+        let renamed = dir.path().join("renamed.bin");
+        fs.rename(&path, &renamed).unwrap();
+        assert_eq!(fs.read(&renamed).unwrap(), Some(data));
+        assert!(fs.read(&path).unwrap().is_none());
+
+        fs.remove_file(&renamed).unwrap();
+        let err = fs.remove_file(&renamed).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
 }

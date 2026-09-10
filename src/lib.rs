@@ -57,7 +57,7 @@ pub mod web;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod native;
 
-use futures::Stream;
+use futures_core::Stream;
 use std::fmt::Debug;
 use std::ops::RangeBounds;
 
@@ -183,13 +183,10 @@ pub trait FileHandle: Debug + private::Sealed {
     /// Creates a synchronous access handle for high-performance read/write.
     ///
     /// On native and memory backends this is always available. On web (wasm32),
-    /// this requires the `unstable_apis` feature flag:
-    /// `RUSTFLAGS='--cfg web_sys_unstable_apis'` or
-    /// ```toml
-    /// # .cargo/config.toml
-    /// [build]
-    /// rustflags = ["--cfg", "web_sys_unstable_apis"]
-    /// ```
+    /// this requires the `unstable_apis` cargo feature
+    /// (`--features unstable_apis`), which enables the
+    /// `web_sys_unstable_apis` cfg required by `web-sys` sync-access bindings.
+    /// Alternatively pass `RUSTFLAGS='--cfg web_sys_unstable_apis'` directly.
     #[cfg(any(not(target_arch = "wasm32"), web_sys_unstable_apis))]
     fn create_sync_access_handle(
         &self,
@@ -361,18 +358,25 @@ impl AppFs {
     }
 
     /// Check whether a file exists at the given path.
+    ///
+    /// Returns `Ok(false)` only when the file or a parent directory is
+    /// missing. Other failures (invalid names, type mismatches, I/O errors,
+    /// quota, ...) are propagated to the caller instead of being silently
+    /// reported as "does not exist".
     pub async fn exists(&mut self, path: &str) -> persistent::Result<bool> {
         use crate::DirectoryHandle as _;
 
         let (parents, file_name) = Self::split_path(path);
         let mut dir = match self.navigate_to(&parents, false).await {
             Ok(d) => d,
-            Err(_) => return Ok(false),
+            Err(e) if e.is_not_found() => return Ok(false),
+            Err(e) => return Err(e),
         };
         let opts = GetFileHandleOptions { create: false };
         match dir.get_file_handle_with_options(file_name, &opts).await {
             Ok(_) => Ok(true),
-            Err(_) => Ok(false),
+            Err(e) if e.is_not_found() => Ok(false),
+            Err(e) => Err(e),
         }
     }
 
@@ -388,7 +392,7 @@ impl AppFs {
     /// List all entries in the root app-specific directory.
     pub async fn list(&self) -> persistent::Result<Vec<String>> {
         use crate::DirectoryHandle as _;
-        use futures::StreamExt;
+        use futures_util::StreamExt;
 
         let entries = self.dir.entries().await?;
         let names = entries

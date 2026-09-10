@@ -1,9 +1,12 @@
 use crate::persistent::Error;
-use futures::Stream;
+use futures_core::Stream;
+use std::collections::HashSet;
 use std::io::SeekFrom;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
@@ -23,7 +26,59 @@ pub struct WritableFileStream {
     file: Option<tokio::fs::File>,
     target_path: PathBuf,
     temp: Option<tempfile::NamedTempFile>,
-    writer_flag: Option<Arc<AtomicBool>>,
+    exclusive_guard: Option<ExclusiveGuard>,
+}
+
+/// Process-wide registry of files currently opened with
+/// [`crate::WritableMode::Exclusive`].
+///
+/// The old per-`FileHandle` flag could not see writers opened through a
+/// *different* handle for the same path. Keying by canonical path closes
+/// that hole; the guard releases the entry on `close()` and on `Drop`
+/// (a stream dropped without `close()` discards its staged data and frees
+/// the lock instead of leaking it).
+static EXCLUSIVE_LOCKS: LazyLock<Mutex<HashSet<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn lock_key(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[derive(Debug)]
+struct ExclusiveGuard {
+    key: PathBuf,
+    flag: Arc<AtomicBool>,
+}
+
+impl ExclusiveGuard {
+    fn acquire(path: &Path, flag: &Arc<AtomicBool>) -> Result<Self, Error> {
+        let key = lock_key(path);
+        let mut locks = EXCLUSIVE_LOCKS
+            .lock()
+            .map_err(|_| Error::Msg("exclusive writer lock poisoned".into()))?;
+        if !locks.insert(key.clone()) {
+            return Err(Error::Msg("File is already open for writing".into()));
+        }
+        drop(locks);
+        flag.store(true, Ordering::SeqCst);
+        Ok(Self {
+            key,
+            flag: flag.clone(),
+        })
+    }
+
+    fn release(&mut self) {
+        if let Ok(mut locks) = EXCLUSIVE_LOCKS.lock() {
+            locks.remove(&self.key);
+        }
+        self.flag.store(false, Ordering::SeqCst);
+    }
+}
+
+impl Drop for ExclusiveGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 #[derive(Debug)]
@@ -51,13 +106,15 @@ impl crate::private::Sealed for SyncAccessHandle {}
 
 fn validate_name(name: &str) -> Result<(), Error> {
     if name.is_empty() {
-        return Err(Error::Msg("name must not be empty".into()));
+        return Err(Error::InvalidName("name must not be empty".into()));
     }
     if name == "." || name == ".." {
-        return Err(Error::Msg(format!("'{}' is not a valid name", name)));
+        return Err(Error::InvalidName(format!("'{name}' is not a valid name")));
     }
     if name.contains('/') || name.contains('\\') {
-        return Err(Error::Msg(format!("'{}' contains path separators", name)));
+        return Err(Error::InvalidName(format!(
+            "'{name}' contains path separators"
+        )));
     }
     Ok(())
 }
@@ -140,7 +197,7 @@ impl crate::DirectoryHandle for DirectoryHandle {
         } else {
             let metadata = tokio::fs::metadata(&path).await?;
             if !metadata.is_dir() {
-                return Err(Error::Msg(format!("'{}' is not a directory", name)));
+                return Err(Error::TypeMismatch(format!("'{name}' is not a directory")));
             }
         }
 
@@ -190,7 +247,7 @@ impl crate::DirectoryHandle for DirectoryHandle {
     ) -> Result<impl Stream<Item = Result<(String, DirectoryEntry), Self::Error>>, Self::Error>
     {
         let read_dir = tokio::fs::read_dir(&self.0).await?;
-        let stream = futures::stream::unfold(read_dir, |mut read_dir| async {
+        let stream = futures_util::stream::unfold(read_dir, |mut read_dir| async {
             loop {
                 match read_dir.next_entry().await {
                     Ok(Some(entry)) => {
@@ -238,11 +295,11 @@ impl crate::FileHandle for FileHandle {
         &mut self,
         options: &crate::CreateWritableOptions,
     ) -> Result<Self::WritableFileStreamT, Self::Error> {
-        if options.mode == crate::WritableMode::Exclusive
-            && self.writer_active.swap(true, Ordering::SeqCst)
-        {
-            return Err(Error::Msg("File is already open for writing".into()));
-        }
+        let exclusive_guard = if options.mode == crate::WritableMode::Exclusive {
+            Some(ExclusiveGuard::acquire(&self.path, &self.writer_active)?)
+        } else {
+            None
+        };
         let parent = self.path.parent().unwrap_or(Path::new("."));
         let temp = tempfile::NamedTempFile::new_in(parent)?;
         let mut file = tokio::fs::File::from_std(temp.as_file().try_clone()?);
@@ -255,17 +312,11 @@ impl crate::FileHandle for FileHandle {
             file.seek(SeekFrom::Start(0)).await?;
         }
 
-        let flag = if options.mode == crate::WritableMode::Exclusive {
-            Some(self.writer_active.clone())
-        } else {
-            None
-        };
-
         Ok(WritableFileStream {
             file: Some(file),
             target_path: self.path.clone(),
             temp: Some(temp),
-            writer_flag: flag,
+            exclusive_guard,
         })
     }
 
@@ -404,9 +455,7 @@ impl crate::WritableFileStream for WritableFileStream {
         if let Some(temp) = self.temp.take() {
             temp.persist(&self.target_path).map_err(|e| e.error)?;
         }
-        if let Some(flag) = self.writer_flag.take() {
-            flag.store(false, Ordering::SeqCst);
-        }
+        drop(self.exclusive_guard.take());
         Ok(())
     }
 
@@ -428,7 +477,7 @@ mod tests {
         CreateWritableOptions, DirectoryHandle as _, FileHandle as _, GetFileHandleOptions,
         SyncAccessHandle as _, WritableFileStream as _, WritableMode,
     };
-    use futures::StreamExt;
+    use futures_util::StreamExt;
     use tempfile::TempDir;
 
     async fn setup_temp_dir() -> (TempDir, DirectoryHandle) {
@@ -837,6 +886,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_exclusive_writer_rejects_across_handles() {
+        let (_temp_dir, mut dir) = setup_temp_dir().await;
+        let options = GetFileHandleOptions { create: true };
+
+        let mut file1 = dir
+            .get_file_handle_with_options("test.txt", &options)
+            .await
+            .unwrap();
+        let mut file2 = dir
+            .get_file_handle_with_options("test.txt", &options)
+            .await
+            .unwrap();
+
+        let write_options = CreateWritableOptions {
+            keep_existing_data: false,
+            mode: WritableMode::Exclusive,
+        };
+        let _writer = file1
+            .create_writable_with_options(&write_options)
+            .await
+            .unwrap();
+
+        let result = file2.create_writable_with_options(&write_options).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_exclusive_writer_releases_on_drop() {
+        let (_temp_dir, mut dir) = setup_temp_dir().await;
+        let options = GetFileHandleOptions { create: true };
+
+        let mut file = dir
+            .get_file_handle_with_options("test.txt", &options)
+            .await
+            .unwrap();
+
+        let write_options = CreateWritableOptions {
+            keep_existing_data: false,
+            mode: WritableMode::Exclusive,
+        };
+        let writer = file
+            .create_writable_with_options(&write_options)
+            .await
+            .unwrap();
+        drop(writer);
+
+        let result = file.create_writable_with_options(&write_options).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
     async fn test_error_matches_portably() {
         let mut dir = DirectoryHandle(PathBuf::from("/nonexistent/path"));
         let result = dir
@@ -844,9 +944,10 @@ mod tests {
             .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
-        match err {
-            Error::Io(_) => {}
-            _ => panic!("expected Io error, got: {:?}", err),
-        }
+        assert!(
+            err.is_not_found(),
+            "expected not-found error, got: {:?}",
+            err
+        );
     }
 }

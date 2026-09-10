@@ -1,6 +1,6 @@
 use crate::persistent::Error;
-use futures::Stream;
-use futures::StreamExt;
+use futures_core::Stream;
+use futures_util::StreamExt;
 use js_sys::{ArrayBuffer, Uint8Array};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,7 +24,10 @@ pub struct FileHandle {
 }
 
 #[derive(Debug)]
-pub struct WritableFileStream(FileSystemWritableFileStream);
+pub struct WritableFileStream {
+    inner: FileSystemWritableFileStream,
+    writer_flag: Option<Arc<AtomicBool>>,
+}
 
 #[derive(Debug, Clone)]
 pub struct File(web_sys::File);
@@ -49,7 +52,20 @@ impl From<FileSystemFileHandle> for FileHandle {
 
 impl From<FileSystemWritableFileStream> for WritableFileStream {
     fn from(handle: FileSystemWritableFileStream) -> Self {
-        Self(handle)
+        Self {
+            inner: handle,
+            writer_flag: None,
+        }
+    }
+}
+
+impl Drop for WritableFileStream {
+    /// A stream dropped without `close()` frees the exclusive lock instead
+    /// of leaking it.
+    fn drop(&mut self) {
+        if let Some(flag) = self.writer_flag.take() {
+            flag.store(false, Ordering::SeqCst);
+        }
     }
 }
 
@@ -202,10 +218,25 @@ impl crate::FileHandle for FileHandle {
         }
         let fs_options = FileSystemCreateWritableOptions::new();
         fs_options.set_keep_existing_data(options.keep_existing_data);
-        let file_system_writable_file_stream = FileSystemWritableFileStream::unchecked_from_js(
-            JsFuture::from(self.inner.create_writable_with_options(&fs_options)).await?,
-        );
-        Ok(WritableFileStream(file_system_writable_file_stream))
+        let stream =
+            match JsFuture::from(self.inner.create_writable_with_options(&fs_options)).await {
+                Ok(js) => FileSystemWritableFileStream::unchecked_from_js(js),
+                Err(e) => {
+                    if options.mode == crate::WritableMode::Exclusive {
+                        self.writer_active.store(false, Ordering::SeqCst);
+                    }
+                    return Err(Error::from(e));
+                }
+            };
+        let writer_flag = if options.mode == crate::WritableMode::Exclusive {
+            Some(self.writer_active.clone())
+        } else {
+            None
+        };
+        Ok(WritableFileStream {
+            inner: stream,
+            writer_flag,
+        })
     }
 
     async fn read(&self) -> Result<Vec<u8>, Self::Error> {
@@ -250,7 +281,7 @@ impl crate::WritableFileStream for WritableFileStream {
         array.push(&uint8_array);
         let file = web_sys::File::new_with_u8_array_sequence(&array, "filename")?;
 
-        JsFuture::from(self.0.write_with_blob(&file)?).await?;
+        JsFuture::from(self.inner.write_with_blob(&file)?).await?;
         Ok(())
     }
 
@@ -280,22 +311,25 @@ impl crate::WritableFileStream for WritableFileStream {
             web_params.set_size(Some(size as f64));
         }
 
-        JsFuture::from(self.0.write_with_write_params(&web_params)?).await?;
+        JsFuture::from(self.inner.write_with_write_params(&web_params)?).await?;
         Ok(())
     }
 
     async fn truncate(&mut self, size: u64) -> Result<(), Self::Error> {
-        JsFuture::from(self.0.truncate_with_f64(size as f64)?).await?;
+        JsFuture::from(self.inner.truncate_with_f64(size as f64)?).await?;
         Ok(())
     }
 
     async fn close(&mut self) -> Result<(), Self::Error> {
-        JsFuture::from(self.0.close()).await?;
+        JsFuture::from(self.inner.close()).await?;
+        if let Some(flag) = self.writer_flag.take() {
+            flag.store(false, Ordering::SeqCst);
+        }
         Ok(())
     }
 
     async fn seek(&mut self, offset: u64) -> Result<(), Self::Error> {
-        JsFuture::from(self.0.seek_with_f64(offset as f64)?).await?;
+        JsFuture::from(self.inner.seek_with_f64(offset as f64)?).await?;
         Ok(())
     }
 }
