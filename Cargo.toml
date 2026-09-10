@@ -12,7 +12,8 @@ description = "A Rust implementation of the Origin Private File System browser A
 unstable_apis = []
 
 [dependencies]
-futures = "0.3"
+futures-core = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 web-time = "1.1"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -21,6 +22,7 @@ wasm-bindgen-futures = { version = "0.4", features = [
     "futures-core-03-stream",
 ] }
 js-sys = "0.3"
+base64 = "0.22"
 web-sys = { version = "0.3", features = [
     "File",
     "Blob",
@@ -43,16 +45,12 @@ web-sys = { version = "0.3", features = [
 ] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokio = { version = "1.52", features = [
-    "fs",
-    "io-util",
-    "sync",
-    "macros",
-    "rt",
-    "rt-multi-thread",
-] }
+tokio = { version = "1", default-features = false, features = ["fs", "io-util"] }
 dirs = "6"
 tempfile = "3.27"
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
