@@ -104,6 +104,34 @@ impl crate::private::Sealed for FileHandle {}
 impl crate::private::Sealed for WritableFileStream {}
 impl crate::private::Sealed for SyncAccessHandle {}
 
+impl DirectoryHandle {
+    /// Recursively sum file sizes under this directory.
+    ///
+    /// Backs [`crate::AppFs::estimate`] on native platforms (best effort:
+    /// entries vanishing mid-walk are skipped).
+    pub async fn storage_usage(&self) -> Result<u64, Error> {
+        async fn walk(dir: &Path) -> Result<u64, Error> {
+            let mut total = 0u64;
+            let mut entries = tokio::fs::read_dir(dir).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let file_type = entry.file_type().await?;
+                if file_type.is_dir() {
+                    total += Box::pin(walk(&entry.path())).await?;
+                } else if file_type.is_file() {
+                    total += entry.metadata().await.map(|m| m.len()).unwrap_or(0);
+                }
+            }
+            Ok(total)
+        }
+
+        match walk(&self.0).await {
+            Ok(total) => Ok(total),
+            Err(e) if e.is_not_found() => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+}
+
 fn validate_name(name: &str) -> Result<(), Error> {
     if name.is_empty() {
         return Err(Error::InvalidName("name must not be empty".into()));
@@ -167,6 +195,11 @@ impl crate::DirectoryHandle for DirectoryHandle {
         path.push(name);
 
         if options.create {
+            if let Ok(metadata) = tokio::fs::metadata(&path).await {
+                if metadata.is_dir() {
+                    return Err(Error::TypeMismatch(format!("'{name}' is a directory")));
+                }
+            }
             tokio::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
@@ -174,7 +207,10 @@ impl crate::DirectoryHandle for DirectoryHandle {
                 .open(&path)
                 .await?;
         } else {
-            tokio::fs::metadata(&path).await?;
+            let metadata = tokio::fs::metadata(&path).await?;
+            if !metadata.is_file() {
+                return Err(Error::TypeMismatch(format!("'{name}' is not a file")));
+            }
         }
 
         Ok(FileHandle {
@@ -484,6 +520,37 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let dir_handle = DirectoryHandle(temp_dir.path().to_path_buf());
         (temp_dir, dir_handle)
+    }
+
+    #[tokio::test]
+    async fn conformance_suite() {
+        crate::conformance::run_suite(setup_temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn backslash_names_rejected() {
+        let (_temp_dir, mut dir) = setup_temp_dir().await;
+        for name in ["back\\slash", "a/b"] {
+            let file_err = dir
+                .get_file_handle_with_options(name, &GetFileHandleOptions { create: true })
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(file_err, Error::InvalidName(_)),
+                "{name:?}: expected InvalidName, got {file_err:?}"
+            );
+            let dir_err = dir
+                .get_directory_handle_with_options(
+                    name,
+                    &crate::GetDirectoryHandleOptions { create: true },
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(dir_err, Error::InvalidName(_)),
+                "{name:?}: expected InvalidName, got {dir_err:?}"
+            );
+        }
     }
 
     #[tokio::test]

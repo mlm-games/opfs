@@ -44,7 +44,7 @@ async fn example(dir: DirectoryHandle) -> persistent::Result<()> {
     let options = GetFileHandleOptions { create: true };
     let mut file = dir.get_file_handle_with_options("example.txt", &options).await?;
     
-    let write_options = CreateWritableOptions { keep_existing_data: false };
+    let write_options = CreateWritableOptions { keep_existing_data: false, mode: Default::default() };
     let mut writer = file.create_writable_with_options(&write_options).await?;
     
     writer.write_at_cursor_pos(b"Hello, world!").await?;
@@ -62,6 +62,47 @@ async fn use_example() -> persistent::Result<()> {
     Ok(())
 }
 ```
+
+## High-level API
+
+`ropfs::AppFs` wraps the app directory with path-based helpers so most code
+never touches handles directly:
+
+```rust
+use ropfs::AppFs;
+
+let mut app = AppFs::new().await.unwrap();
+app.write("saves/slot1.bin", &data).await.unwrap();
+app.append("log.txt", b"hit\n").await.unwrap();
+let text = app.read_to_string("config.json").await.unwrap();
+app.rename("saves/slot1.bin", "saves/slot1.bak").await.unwrap();
+let estimate = app.estimate().await.unwrap(); // quota/usage
+```
+
+It also offers `metadata`/`is_file`/`is_dir`, `copy`, `remove_dir`/
+`remove_dir_all`, `list_dir`/`list_recursive`, `clear`, and
+`persist`/`persisted`. Multi-step operations (`rename`, `copy`) copy first
+and delete last — they are not atomic.
+
+## Storage location
+
+`AppFs::new()` uses a legacy executable-stem directory
+(`~/.local/share/<app-name>/` on Linux). New applications should prefer
+`AppFs::new_for(&AppInfo { qualifier, organization, application })`, which
+resolves OS-conventional project paths via the `directories` crate and
+migrates legacy data forward once (non-destructively — the old directory is
+left behind).
+
+## Testing
+
+```bash
+cargo test                                        # host: native + memory backends
+cargo test --target wasm32-unknown-unknown --lib  # headless Chromium: OPFS + memory
+```
+
+The wasm suite runs a shared conformance battery (`src/conformance.rs`)
+against every backend. It needs `chromedriver` or `geckodriver` on `PATH`;
+set `NO_HEADLESS=1` for a visible browser.
 
 ## Origin
 

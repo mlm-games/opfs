@@ -1,6 +1,6 @@
 [package]
 name = "ropfs"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 repository = "https://github.com/mlm-games/ropfs"
@@ -28,6 +28,7 @@ web-sys = { version = "0.3", features = [
     "Blob",
     "Navigator",
     "Storage",
+    "StorageEstimate",
     "StorageManager",
     "Window",
     "FileSystemDirectoryHandle",
@@ -47,6 +48,7 @@ web-sys = { version = "0.3", features = [
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1", default-features = false, features = ["fs", "io-util"] }
 dirs = "6"
+directories = "6"
 tempfile = "3.27"
 
 [dev-dependencies]

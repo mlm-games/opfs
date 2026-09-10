@@ -272,6 +272,44 @@ impl FileHandle {
     }
 }
 
+fn storage_manager() -> Result<web_sys::StorageManager, Error> {
+    let window = web_sys::window().ok_or_else(|| Error::Msg("No window object".to_string()))?;
+    Ok(window.navigator().storage())
+}
+
+/// Origin storage quota/usage via `navigator.storage.estimate()`.
+///
+/// Backs [`crate::AppFs::estimate`] on web.
+pub async fn storage_estimate() -> Result<crate::StorageEstimate, Error> {
+    let promise = storage_manager()?.estimate().map_err(Error::from)?;
+    let value = JsFuture::from(promise).await?;
+    let estimate = web_sys::StorageEstimate::unchecked_from_js(value);
+    Ok(crate::StorageEstimate {
+        quota: estimate.get_quota().map(|q| q as u64),
+        usage: estimate.get_usage().map(|u| u as u64),
+    })
+}
+
+/// Request persistent storage via `navigator.storage.persist()`.
+///
+/// Backs [`crate::AppFs::persist`] on web. Note: without user activation
+/// (e.g. headless/automated Firefox) this promise may never settle; call it
+/// from a user gesture in production code.
+pub async fn storage_persist() -> Result<bool, Error> {
+    let promise = storage_manager()?.persist().map_err(Error::from)?;
+    let value = JsFuture::from(promise).await?;
+    Ok(value.as_bool().unwrap_or(false))
+}
+
+/// Query persistent-storage status via `navigator.storage.persisted()`.
+///
+/// Backs [`crate::AppFs::persisted`] on web.
+pub async fn storage_persisted() -> Result<bool, Error> {
+    let promise = storage_manager()?.persisted().map_err(Error::from)?;
+    let value = JsFuture::from(promise).await?;
+    Ok(value.as_bool().unwrap_or(false))
+}
+
 impl crate::WritableFileStream for WritableFileStream {
     type Error = Error;
 
@@ -391,5 +429,76 @@ impl File {
             .await?
             .as_string()
             .ok_or(Error::Msg("Failed to decode text".into()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DirectoryHandle;
+    use crate::{DirectoryHandle as _, FileSystemRemoveOptions, GetDirectoryHandleOptions};
+    use futures_util::StreamExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+    static SUITE_NEXT: AtomicU64 = AtomicU64::new(0);
+
+    /// Fresh isolated OPFS subdirectory per suite run, with stale suites
+    /// from previous runs cleaned up best-effort.
+    async fn setup_conformance() -> ((), DirectoryHandle) {
+        let n = SUITE_NEXT.fetch_add(1, Ordering::SeqCst);
+        let mut root = crate::persistent::app_specific_dir().await.unwrap();
+        let stale: Vec<String> = match root.entries().await {
+            Ok(stream) => stream
+                .filter_map(|r| async { r.ok().map(|(name, _)| name) })
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .filter(|name| name.starts_with("ropfs-conf-"))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        for name in stale {
+            let _ = root
+                .remove_entry_with_options(&name, &FileSystemRemoveOptions { recursive: true })
+                .await;
+        }
+        let dir = root
+            .get_directory_handle_with_options(
+                &format!("ropfs-conf-{n}"),
+                &GetDirectoryHandleOptions { create: true },
+            )
+            .await
+            .unwrap();
+        ((), dir)
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    async fn conformance_suite() {
+        crate::conformance::run_suite(setup_conformance).await;
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    async fn storage_management() {
+        let estimate = crate::persistent::storage_estimate().await.unwrap();
+        assert!(estimate.usage.is_some());
+        let _ = crate::persistent::storage_persisted().await.unwrap();
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    #[ignore = "navigator.storage.persist() never settles in headless Firefox (no user activation); run manually in Chrome"]
+    async fn storage_persist_manual() {
+        let _ = crate::persistent::storage_persist().await.unwrap();
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    async fn backslash_name_allowed() {
+        let (_guard, mut dir) = setup_conformance().await;
+        dir.get_file_handle_with_options(
+            "back\\slash",
+            &crate::GetFileHandleOptions { create: true },
+        )
+        .await
+        .unwrap();
     }
 }

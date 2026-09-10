@@ -401,7 +401,7 @@ impl Drop for WritableFileStream {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use crate::{
@@ -409,6 +409,24 @@ mod tests {
         SyncAccessHandle as _, WritableFileStream as _, WritableMode,
     };
     use futures_util::StreamExt;
+
+    #[tokio::test]
+    async fn conformance_suite() {
+        crate::conformance::run_suite(|| async { ((), DirectoryHandle::default()) }).await;
+    }
+
+    #[tokio::test]
+    async fn backslash_names_rejected() {
+        let mut dir = DirectoryHandle::default();
+        let file_err = dir
+            .get_file_handle_with_options("back\\slash", &GetFileHandleOptions { create: true })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(file_err, Error::InvalidName(_)),
+            "expected InvalidName, got {file_err:?}"
+        );
+    }
 
     #[tokio::test]
     async fn test_create_and_read_file() {
@@ -928,5 +946,17 @@ mod tests {
             Error::InvalidName(msg) => assert!(msg.contains("empty")),
             _ => panic!("expected InvalidName error, got: {:?}", err),
         }
+    }
+}
+
+/// Memory conformance on wasm (same shared suite, driven by
+/// `wasm-bindgen-test` since tokio's test runtime is unavailable there).
+#[cfg(all(test, target_arch = "wasm32"))]
+mod conformance_wasm {
+    use super::DirectoryHandle;
+
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    async fn conformance_suite() {
+        crate::conformance::run_suite(|| async { ((), DirectoryHandle::default()) }).await;
     }
 }

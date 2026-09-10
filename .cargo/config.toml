@@ -1,5 +1,10 @@
 [target.wasm32-unknown-unknown]
 rustflags = ["--cfg=web_sys_unstable_apis"]
+# `cargo test --target wasm32-unknown-unknown --lib` runs the suite in a
+# headless browser through chromedriver/geckodriver (one required on PATH;
+# OPFS needs a real browser, not Node.js). Set NO_HEADLESS=1 for a visible
+# browser window.
+runner = "wasm-bindgen-test-runner"
 
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "link-arg=/STACK:8000000"]
