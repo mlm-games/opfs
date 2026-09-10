@@ -1,12 +1,12 @@
 [package]
-name = "opfs"
+name = "ropfs"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
-repository = "https://github.com/anchpop/opfs.git"
+repository = "https://github.com/mlm-games/ropfs"
 license = "MIT"
-authors = ["Andre Popovitch <andre@popovit.ch>"]
-description = "A Rust implementation of the Origin Private File System browser API."
+authors = ["mlm-games"]  #["Andre Popovitch <andre@popovit.ch>"]
+description = "A Rust implementation of the Origin Private File System browser API (fork)."
 
 [features]
 unstable_apis = []

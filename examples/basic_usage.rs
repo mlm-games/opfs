@@ -1,4 +1,4 @@
-//! Basic usage example for the OPFS crate
+//! Basic usage example for the ropfs crate
 //!
 //! This example demonstrates the fundamental operations:
 //! - Creating/getting a file handle
@@ -6,11 +6,11 @@
 //! - Reading data from a file
 //! - Directory operations
 
-use opfs::persistent::{DirectoryHandle, FileHandle, WritableFileStream, app_specific_dir};
-use opfs::{CreateWritableOptions, GetFileHandleOptions};
+use ropfs::persistent::{DirectoryHandle, FileHandle, WritableFileStream, app_specific_dir};
+use ropfs::{CreateWritableOptions, GetFileHandleOptions};
 
 // Import the traits to call methods on the types
-use opfs::{DirectoryHandle as _, FileHandle as _, WritableFileStream as _};
+use ropfs::{DirectoryHandle as _, FileHandle as _, WritableFileStream as _};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

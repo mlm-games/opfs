@@ -51,10 +51,7 @@ fn validate_name(name: &str) -> Result<(), Error> {
         return Err(Error::Msg(format!("'{}' is not a valid name", name)));
     }
     if name.contains('/') || name.contains('\\') {
-        return Err(Error::Msg(format!(
-            "'{}' contains path separators",
-            name
-        )));
+        return Err(Error::Msg(format!("'{}' contains path separators", name)));
     }
     Ok(())
 }
@@ -174,13 +171,10 @@ impl crate::DirectoryHandle for DirectoryHandle {
 
         if let Some(entry) = directory.get(name) {
             match entry {
-                DirectoryEntry::Directory(dir) if !options.recursive => {
-                    if !dir.0.read().unwrap().is_empty() {
-                        return Err(Error::Msg(format!(
-                            "Directory '{}' is not empty",
-                            name
-                        )));
-                    }
+                DirectoryEntry::Directory(dir)
+                    if !options.recursive && !dir.0.read().unwrap().is_empty() =>
+                {
+                    return Err(Error::Msg(format!("Directory '{name}' is not empty")));
                 }
                 _ => {}
             }
@@ -201,14 +195,12 @@ impl crate::DirectoryHandle for DirectoryHandle {
             dir.keys().cloned().collect()
         };
         let inner = self.0.clone();
-        let stream = futures::stream::unfold(
-            (keys.into_iter(), inner),
-            |(mut iter, inner)| async {
+        let stream =
+            futures::stream::unfold((keys.into_iter(), inner), |(mut iter, inner)| async {
                 let name = iter.next()?;
                 let entry = inner.read().unwrap().get(&name)?.clone();
                 Some((Ok((name, entry)), (iter, inner)))
-            },
-        );
+            });
         Ok(stream)
     }
 }
@@ -395,11 +387,11 @@ impl crate::WritableFileStream for WritableFileStream {
 
 #[cfg(test)]
 mod tests {
-use super::*;
-use crate::{
-    CreateWritableOptions, DirectoryHandle as _, FileHandle as _, GetFileHandleOptions,
-    SyncAccessHandle as _, WritableFileStream as _, WritableMode,
-};
+    use super::*;
+    use crate::{
+        CreateWritableOptions, DirectoryHandle as _, FileHandle as _, GetFileHandleOptions,
+        SyncAccessHandle as _, WritableFileStream as _, WritableMode,
+    };
     use futures::StreamExt;
 
     #[tokio::test]
@@ -762,10 +754,7 @@ use crate::{
             .create_writable_with_options(&write_options)
             .await
             .unwrap();
-        writer
-            .write_at_cursor_pos(b"Hello, World!")
-            .await
-            .unwrap();
+        writer.write_at_cursor_pos(b"Hello, World!").await.unwrap();
         writer.close().await.unwrap();
 
         let sync_handle = file_handle.create_sync_access_handle().await.unwrap();

@@ -3,8 +3,8 @@ use futures::Stream;
 use std::io::SeekFrom;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 type DirectoryEntry = crate::DirectoryEntry<DirectoryHandle, FileHandle>;
@@ -57,10 +57,7 @@ fn validate_name(name: &str) -> Result<(), Error> {
         return Err(Error::Msg(format!("'{}' is not a valid name", name)));
     }
     if name.contains('/') || name.contains('\\') {
-        return Err(Error::Msg(format!(
-            "'{}' contains path separators",
-            name
-        )));
+        return Err(Error::Msg(format!("'{}' contains path separators", name)));
     }
     Ok(())
 }
@@ -201,10 +198,7 @@ impl crate::DirectoryHandle for DirectoryHandle {
                             Ok(n) => n,
                             Err(os_string) => {
                                 return Some((
-                                    Err(Error::Msg(format!(
-                                        "Invalid filename: {:?}",
-                                        os_string
-                                    ))),
+                                    Err(Error::Msg(format!("Invalid filename: {:?}", os_string))),
                                     read_dir,
                                 ));
                             }
@@ -751,10 +745,7 @@ mod tests {
             .create_writable_with_options(&write_options)
             .await
             .unwrap();
-        writer
-            .write_at_cursor_pos(b"Hello, World!")
-            .await
-            .unwrap();
+        writer.write_at_cursor_pos(b"Hello, World!").await.unwrap();
         writer.close().await.unwrap();
 
         let sync_handle = file_handle.create_sync_access_handle().await.unwrap();

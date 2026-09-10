@@ -1,0 +1,21 @@
+name: CI
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: fmt
+        run: cargo fmt --check
+      - name: clippy (native)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test (native)
+        run: cargo test
+      - name: check (wasm lib; examples/tests are native-only via tokio)
+        run: cargo check --target wasm32-unknown-unknown --lib

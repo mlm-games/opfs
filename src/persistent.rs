@@ -79,9 +79,7 @@ pub async fn app_specific_dir() -> Result<DirectoryHandle> {
     use wasm_bindgen_futures::JsFuture;
     use web_sys::FileSystemDirectoryHandle;
 
-    let window = web_sys::window().ok_or_else(|| {
-        Error::Msg("No window object".to_string())
-    })?;
+    let window = web_sys::window().ok_or_else(|| Error::Msg("No window object".to_string()))?;
     let navigator = window.navigator();
 
     let root_directory_handle =
@@ -109,7 +107,7 @@ pub async fn app_specific_dir() -> Result<DirectoryHandle> {
     let app_name = std::env::current_exe()
         .ok()
         .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
-        .unwrap_or_else(|| "opfs".to_string());
+        .unwrap_or_else(|| "ropfs".to_string());
 
     let app_dir = data_dir.join(&app_name);
 

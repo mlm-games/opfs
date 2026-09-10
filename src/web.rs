@@ -2,8 +2,8 @@ use crate::persistent::Error;
 use futures::Stream;
 use futures::StreamExt;
 use js_sys::{ArrayBuffer, Uint8Array};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::{JsFuture, stream::JsStream};
 use web_sys::{
@@ -155,33 +155,31 @@ impl crate::DirectoryHandle for DirectoryHandle {
         let entries_iterator = self.0.entries();
         let js_stream: JsStream = JsStream::from(entries_iterator);
 
-        let stream = js_stream.map(|item| {
-            match item {
-                Ok(js_array) => {
-                    let array = js_sys::Array::from(&js_array);
-                    let filename = array
-                        .get(0)
-                        .as_string()
-                        .ok_or_else(|| JsValue::from_str("Invalid filename"))?;
-                    let handle = array.get(1);
+        let stream = js_stream.map(|item| match item {
+            Ok(js_array) => {
+                let array = js_sys::Array::from(&js_array);
+                let filename = array
+                    .get(0)
+                    .as_string()
+                    .ok_or_else(|| JsValue::from_str("Invalid filename"))?;
+                let handle = array.get(1);
 
-                    let entry = if handle.has_type::<FileSystemFileHandle>() {
-                        DirectoryEntry::File(FileHandle {
-                            inner: FileSystemFileHandle::from(handle),
-                            writer_active: Arc::new(AtomicBool::new(false)),
-                        })
-                    } else if handle.has_type::<FileSystemDirectoryHandle>() {
-                        DirectoryEntry::Directory(DirectoryHandle(
-                            FileSystemDirectoryHandle::from(handle),
-                        ))
-                    } else {
-                        return Err(Error::Msg("Unknown handle type".to_string()));
-                    };
+                let entry = if handle.has_type::<FileSystemFileHandle>() {
+                    DirectoryEntry::File(FileHandle {
+                        inner: FileSystemFileHandle::from(handle),
+                        writer_active: Arc::new(AtomicBool::new(false)),
+                    })
+                } else if handle.has_type::<FileSystemDirectoryHandle>() {
+                    DirectoryEntry::Directory(DirectoryHandle(FileSystemDirectoryHandle::from(
+                        handle,
+                    )))
+                } else {
+                    return Err(Error::Msg("Unknown handle type".to_string()));
+                };
 
-                    Ok((filename, entry))
-                }
-                Err(e) => Err(Error::from(e)),
+                Ok((filename, entry))
             }
+            Err(e) => Err(Error::from(e)),
         });
 
         Ok(stream)
@@ -230,7 +228,8 @@ impl crate::FileHandle for FileHandle {
     #[cfg(web_sys_unstable_apis)]
     async fn create_sync_access_handle(&self) -> Result<Self::SyncAccessHandleT, Self::Error> {
         let handle = JsFuture::from(self.inner.create_sync_access_handle()).await?;
-        let handle = wasm_bindgen::JsCast::unchecked_into::<web_sys::FileSystemSyncAccessHandle>(handle);
+        let handle =
+            wasm_bindgen::JsCast::unchecked_into::<web_sys::FileSystemSyncAccessHandle>(handle);
         Ok(SyncAccessHandle(handle))
     }
 }
@@ -307,18 +306,14 @@ impl File {
     }
 
     async fn read(&self) -> Result<Vec<u8>, Error> {
-        let buffer =
-            ArrayBuffer::unchecked_from_js(JsFuture::from(self.0.array_buffer()).await?);
+        let buffer = ArrayBuffer::unchecked_from_js(JsFuture::from(self.0.array_buffer()).await?);
         let uint8_array = Uint8Array::new(&buffer);
         let mut vec = vec![0; self.size() as usize];
         uint8_array.copy_to(&mut vec);
         Ok(vec)
     }
 
-    async fn read_range<R: std::ops::RangeBounds<u64>>(
-        &self,
-        range: R,
-    ) -> Result<Vec<u8>, Error> {
+    async fn read_range<R: std::ops::RangeBounds<u64>>(&self, range: R) -> Result<Vec<u8>, Error> {
         use std::ops::Bound;
         use web_sys::Blob;
 
@@ -349,8 +344,7 @@ impl File {
             .0
             .slice_with_f64_and_f64(start as f64, actual_end as f64)?;
 
-        let buffer =
-            ArrayBuffer::unchecked_from_js(JsFuture::from(blob.array_buffer()).await?);
+        let buffer = ArrayBuffer::unchecked_from_js(JsFuture::from(blob.array_buffer()).await?);
         let uint8_array = Uint8Array::new(&buffer);
         let mut vec = vec![0; (actual_end - start) as usize];
         uint8_array.copy_to(&mut vec);

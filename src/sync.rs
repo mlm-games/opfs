@@ -42,7 +42,7 @@ impl Fs {
 
     #[cfg(target_arch = "wasm32")]
     fn ls_prefix() -> &'static str {
-        "opfs:"
+        "ropfs:"
     }
 
     #[cfg(target_arch = "wasm32")]

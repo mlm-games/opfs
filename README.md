@@ -1,4 +1,8 @@
-# OPFS Rust
+# ropfs
+
+[![Crates.io](https://img.shields.io/crates/v/ropfs)](https://crates.io/crates/ropfs)
+[![License](https://img.shields.io/github/license/mlm-games/ropfs)](LICENSE)
+[![docs.rs](https://img.shields.io/docsrs/ropfs)](https://docs.rs/ropfs)
 
 Rust wrapper for the the [Origin Private File System](https://developer.mozilla.org/en-US/docs/Web/API/File_System_API/Origin_private_file_system) browser API. (This is an API that gives webapps limited access to the native file system.) 
 
@@ -22,18 +26,18 @@ An in-memory filesystem is also provided for use in tests (or when persistence i
 ## Installation
 
 ```
-cargo add opfs
+cargo add ropfs
 ```
 
 ## Usage
 
 ```rust
-use opfs::persistent::{DirectoryHandle, FileHandle, WritableFileStream, app_specific_dir};
-use opfs::{GetFileHandleOptions, CreateWritableOptions};
-use opfs::persistent;
+use ropfs::persistent::{DirectoryHandle, FileHandle, WritableFileStream, app_specific_dir};
+use ropfs::{GetFileHandleOptions, CreateWritableOptions};
+use ropfs::persistent;
 
 // you must import the traits to call methods on the types
-use opfs::{DirectoryHandle as _, FileHandle as _, WritableFileStream as _};
+use ropfs::{DirectoryHandle as _, FileHandle as _, WritableFileStream as _};
 
 // This code works on both native and web platforms
 async fn example(dir: DirectoryHandle) -> persistent::Result<()> {
@@ -58,3 +62,25 @@ async fn use_example() -> persistent::Result<()> {
     Ok(())
 }
 ```
+
+## Origin
+
+Forked from [anchpop/opfs](https://github.com/anchpop/opfs), renamed to `ropfs`.
+
+## Contributing
+
+Issues and PRs are welcome, especially for:
+- Correctness bugs
+- Platform gaps (native vs web behaviour differences)
+
+```bash
+git clone https://github.com/mlm-games/ropfs
+cd ropfs
+cargo test
+```
+
+## License
+
+MIT
+
+See [LICENSE](LICENSE) for more info.

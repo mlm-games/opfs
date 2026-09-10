@@ -1,7 +1,7 @@
-//! Example demonstrating advanced file operations with the OPFS library
+//! Example demonstrating advanced file operations with the ropfs library
 
-use opfs::persistent::{DirectoryHandle, app_specific_dir};
-use opfs::{
+use ropfs::persistent::{DirectoryHandle, app_specific_dir};
+use ropfs::{
     CreateWritableOptions, DirectoryHandle as _, FileHandle as _, GetFileHandleOptions,
     WritableFileStream as _, WriteCommandType, WriteParams,
 };
